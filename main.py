@@ -3,52 +3,55 @@ import re
 import ast
 import pathlib
 import datetime
+import asyncio
 from urllib.parse import urlparse
-from flask import Flask, request, render_template_string, Response, stream_with_context
-import requests
+from quart import Quart, request, render_template_string, Response, stream_with_context
+import httpx
 from bs4 import BeautifulSoup
 
-# Selenium関連のインポート
+# Selenium関連
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
-app = Flask(__name__)
+app = Quart(__name__)
 
-# --- サイト設定 ---
 siteList = {
     'zozovideo.com': {'name': 'zozo', 'code': 0},
     'jp.spankbang.com': {'name': 'spank', 'code': 1}
 }
 
-def getDate():
-    return datetime.datetime.now().strftime('%Y/%m/%d-%H:%M')
-
-# --- ヘッドレスChromeの初期化関数 ---
 def get_headless_driver():
     chrome_options = Options()
-    chrome_options.add_argument('--headless')  # 画面非表示
+    chrome_options.add_argument('--headless')
     chrome_options.add_argument('--no-sandbox')
     chrome_options.add_argument('--disable-dev-shm-usage')
     chrome_options.add_argument('--disable-gpu')
     chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
     
-    # Render環境（Linux）で安定してパスを通す設定
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
     return driver
 
-def getBySelenium(url):
-    driver = get_headless_driver()
+# 外部ブロックを防ぐため非同期でドライバーを実行
+async def getBySeleniumAsync(url, queue):
+    await queue.put("⚙️ ヘッドレスChromeを起動中...")
+    # Seleniumのブロッキング処理を別スレッドで安全に実行
+    loop = asyncio.get_event_loop()
+    driver = await loop.run_in_executor(None, get_headless_driver)
+    
     try:
-        driver.get(url)
-        html = driver.page_source
+        await queue.put(f"🌐 ターゲットサイトに接続中: {url}")
+        await loop.run_in_executor(None, driver.get, url)
+        
+        await queue.put("📄 ページのレンダリング完了。HTMLを抽出しています...")
+        html = await loop.run_in_executor(None, lambda: driver.page_source)
     finally:
-        driver.quit()  # メモリリーク防止のため必ず閉じる
+        await queue.put("🧹 ブラウザを安全に閉じています...")
+        await loop.run_in_executor(None, driver.quit)
     return html
 
-# --- 元のスクレイピングロジック群 ---
 def getZozo(soup):
     result = {'title': 'Unknown', 'status': [], 'information': {}}
     video = soup.find(id='video')
@@ -96,32 +99,7 @@ def getSpank(soup):
         result['title'] = video.find('h1').text.strip()
     return result
 
-def minProcess(url):
-    url = url.strip()
-    sitenameRe = r'^https?://([^/]+)'
-    if not re.match(sitenameRe, url):
-        return {'ok': False, 'status': '不正なURLです'}
-    
-    sitename = re.match(sitenameRe, url).group(1)
-    site = siteList.get(sitename, {'name': 'other', 'code': 10})
-
-    try:
-        # ご指定通りすべてのサイトをSelenium経由でHTML取得
-        html_text = getBySelenium(url)
-        soup = BeautifulSoup(html_text, 'html.parser')
-        
-        if site['name'] == 'zozo':
-            data = getZozo(soup)
-        elif site['name'] == 'spank':
-            data = getSpank(soup)
-        else:
-            data = {'title': 'Unknown', 'status': ['Unsupported site']}
-            
-        return {'ok': True, 'data': data, 'url': url}
-    except Exception as e:
-        return {'ok': False, 'status': f'解析エラー: {e}'}
-
-# --- HTML テンプレート (フロントエンド) ---
+# --- WEB UI (リアルタイム進捗対応) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ja">
@@ -137,94 +115,182 @@ HTML_TEMPLATE = """
         button:hover { background: #0056b3; }
         .download-btn { background: #28a745; margin-top: 15px; display: inline-block; text-align: center; text-decoration: none; color: white; padding: 12px; border-radius: 4px; width: 100%; box-sizing: border-box; font-weight: bold; }
         .download-btn:hover { background: #218838; }
-        a { color: #007bff; word-break: break-all; }
+        #progress-box { display: none; background: #e9ecef; border-left: 4px solid #007bff; padding: 12px; margin-top: 20px; border-radius: 4px; font-size: 14px; color: #495057; }
+        #result-container { margin-top: 20px; }
         table { width: 100%; border-collapse: collapse; margin-top: 10px; }
         th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
         th { background: #f2f2f2; }
     </style>
 </head>
 <body>
-    <h2>🎬 EC動画解析 & ダウンロード</h2>
-    <form method="POST" action="/">
-        <input type="text" name="url" placeholder="動画のURLを入力（zozo / spankbang）" value="{{ url or '' }}" required>
-        <button type="submit">解析スタート</button>
-    </form>
+    <h2>🎬 EC動画解析 & ダウンロード (非同期)</h2>
+    <div>
+        <input type="text" id="url-input" placeholder="動画のURLを入力（zozo / spankbang）" required>
+        <button type="button" id="start-btn">解析スタート</button>
+    </div>
 
-    {% if error %}
-        <div class="card" style="color: red;">{{ error }}</div>
-    {% endif %}
+    <div id="progress-box">⏳ 進捗ステータス待ち...</div>
+    <div id="result-container"></div>
 
-    {% if data %}
-        <div class="card">
-            <h3>🎵 {{ data.get('title', 'タイトル不明') }}</h3>
+    <script>
+        document.getElementById('start-btn').addEventListener('click', function() {
+            const url = document.getElementById('url-input').value.trim();
+            if (!url) return alert('URLを入力してください');
+
+            const progressBox = document.getElementById('progress-box');
+            const resultContainer = document.getElementById('result-container');
             
-            {% if data.get('information') %}
-                <h4>📋 作品情報</h4>
-                <table>
-                    {% for k, v in data['information'].items() %}
-                    <tr><th>{{ k }}</th><td>{{ v }}</td></tr>
-                    {% endfor %}
-                </table>
-            {% endif %}
+            progressBox.style.display = 'block';
+            progressBox.innerText = '🚀 サーバーへ解析要求を送信中...';
+            resultContainer.innerHTML = '';
 
-            <h4>🔗 リンク (タッチで開けます)</h4>
-            <p>・元ページ: <a href="{{ url }}" target="_blank">{{ url }}</a></p>
-            
-            {% if data.get('video_url') %}
-                <p>・直接動画: <a href="{{ data['video_url'] }}" target="_blank">ブラウザで動画を開く</a></p>
-                <a class="download-btn" href="/download?video_url={{ data['video_url'] | urlencode }}">📥 この動画をダウンロード (MP4保存)</a>
-            {% else %}
-                <p style="color: orange;">⚠️ 動画URLの解析に失敗したか、ページ内に見つかりませんでした。</p>
-            {% endif %}
-        </div>
-    {% endif %}
+            // SSE を利用して進行状況のテキストをストリーミング受信
+            const eventSource = new EventSource('/analyze?url=' + encodeURIComponent(url));
+
+            eventSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                
+                if (data.type === 'progress') {
+                    progressBox.innerText = data.message;
+                } 
+                else if (data.type === 'success') {
+                    progressBox.innerText = '✅ 解析が完了しました！';
+                    renderResult(data.data, url);
+                    eventSource.close();
+                } 
+                else if (data.type === 'error') {
+                    progressBox.style.display = 'none';
+                    resultContainer.innerHTML = `<div class="card" style="color: red;">❌ エラー: ${data.message}</div>`;
+                    eventSource.close();
+                }
+            };
+
+            eventSource.onerror = function() {
+                progressBox.innerText = '⚠️ 通信中にエラーが発生しました。';
+                eventSource.close();
+            };
+        });
+
+        function renderResult(data, originalUrl) {
+            let infoRows = '';
+            if (data.information) {
+                for (const [k, v] of Object.entries(data.information)) {
+                    infoRows += `<tr><th>${k}</th><td>${v}</td></tr>`;
+                }
+            }
+
+            let html = `
+                <div class="card">
+                    <h3>🎵 ${data.title || 'タイトル不明'}</h3>
+                    ${infoRows ? `<h4>📋 作品情報</h4><table>${infoRows}</table>` : ''}
+                    <h4>🔗 リンク</h4>
+                    <p>・元ページ: <a href="${originalUrl}" target="_blank">${originalUrl}</a></p>
+            `;
+
+            if (data.video_url) {
+                html += `
+                    <p>・直接動画: <a href="${data.video_url}" target="_blank">ブラウザで動画を開く</a></p>
+                    <a class="download-btn" href="/download?video_url=${encodeURIComponent(data.video_url)}">📥 この動画をダウンロード (MP4保存)</a>
+                `;
+            } else {
+                html += `<p style="color: orange;">⚠️ 動画URLの解析に失敗したか、ページ内に見つかりませんでした。</p>`;
+            }
+
+            html += `</div>`;
+            document.getElementById('result-container').innerHTML = html;
+        }
+    </script>
 </body>
 </html>
 """
 
-# --- ルーター設定 ---
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    if request.method == 'POST':
-        url = request.form.get('url')
-        res = minProcess(url)
-        if res['ok']:
-            return render_template_string(HTML_TEMPLATE, data=res['data'], url=url)
-        else:
-            return render_template_string(HTML_TEMPLATE, error=res['status'], url=url)
-    return render_template_string(HTML_TEMPLATE)
+@app.route('/')
+async def index():
+    return await render_template_string(HTML_TEMPLATE)
+
+@app.route('/analyze')
+async def analyze():
+    url = request.args.get('url', '').strip()
+    
+    async def generate_progress():
+        if not url:
+            yield f"data: {{\\"type\\": \\"error\\", \\"message\\": \\"URLが空です\\"}}\\n\\n"
+            return
+
+        sitenameRe = r'^https?://([^/]+)'
+        if not re.match(sitenameRe, url):
+            yield f"data: {{\\"type\\": \\"error\\", \\"message\\": \\"不正なURL構造です\\"}}\\n\\n"
+            return
+
+        sitename = re.match(sitenameRe, url).group(1)
+        site = siteList.get(sitename, {'name': 'other'})
+
+        # スレッドセーフな非同期キューで進捗メッセージを受け渡す
+        queue = asyncio.Queue()
+
+        async def run_scraper():
+            try:
+                html_text = await getBySeleniumAsync(url, queue)
+                await queue.put("🔍 解析用スープを作成中 (BeautifulSoup)...")
+                soup = BeautifulSoup(html_text, 'html.parser')
+                
+                await queue.put("⚡ ターゲットデータを抽出中...")
+                if site['name'] == 'zozo':
+                    data = getZozo(soup)
+                elif site['name'] == 'spank':
+                    data = getSpank(soup)
+                else:
+                    data = {'title': 'Unknown', 'status': ['Unsupported site']}
+                
+                await queue.put(('SUCCESS', data))
+            except Exception as e:
+                await queue.put(('ERROR', str(e)))
+
+        # スクレイピングタスクをバックグラウンドで開始
+        scraper_task = asyncio.create_task(run_scraper())
+
+        # キューから進捗状況を取り出して逐次クライアントへ送信
+        while true:
+            msg = await queue.get()
+            if isinstance(msg, tuple):
+                status_type, payload = msg
+                if status_type == 'SUCCESS':
+                    import json
+                    yield f"data: {{\\"type\\": \\"success\\", \\"data\\": {json.dumps(payload)}}}\\n\\n"
+                else:
+                    yield f"data: {{\\"type\\": \\"error\\", \\"message\\": \\"{payload}\\"}}\\n\\n"
+                break
+            else:
+                yield f"data: {{\\"type\\": \\"progress\\", \\"message\\": \\"{msg}\\"}}\\n\\n"
+
+    return Response(generate_progress(), content_type='text/event-stream')
 
 @app.route('/download')
-def download():
-    """バックエンド経由で大容量のMP4をストリーミングダウンロードさせる"""
+async def download():
     video_url = request.args.get('video_url')
     if not video_url:
         return "URLが指定されていません", 400
 
-    parsed_url = urlparse(video_url)
-    filename = pathlib.Path(parsed_url.path).name
-    if not filename.endswith('.mp4'):
-        filename = "video.mp4"
+    filename = pathlib.Path(urlparse(video_url).path).name or "video.mp4"
 
     try:
-        # stream=True でチャンクごとにデータを読み込んでクライアントへ即時転送
-        req = requests.get(video_url, stream=True)
-        req.raise_for_status()
-
-        def generate():
-            for chunk in req.iter_content(chunk_size=8192):
-                if chunk:
-                    yield chunk
+        # ダウンロード側も非同期の httpx を用いてストリーミング配信
+        async def stream_download():
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream("GET", video_url) as r:
+                    r.raise_for_status()
+                    async for chunk in r.iter_bytes(chunk_size=8192):
+                        yield chunk
 
         return Response(
-            stream_with_context(generate()),
+            stream_with_context(stream_download()),
             headers={
                 "Content-Disposition": f"attachment; filename={filename}",
                 "Content-Type": "video/mp4"
             }
         )
     except Exception as e:
-        return f"ダウンロード中にエラーが発生しました: {e}", 500
+        return f"ダウンロードエラー: {e}", 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
