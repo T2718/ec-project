@@ -215,7 +215,6 @@ async def analyze():
     
     async def generate_progress():
         if not url:
-            # シングルクォーテーションで囲むことで、内部のダブルクォーテーションのエスケープを不要に
             yield f'data: {{"type": "error", "message": "URLが空です"}}\n\n'
             return
 
@@ -279,6 +278,7 @@ async def analyze():
             else:
                 yield f'data: {{"type": "progress", "message": "{msg}"}}\n\n'
 
+    # 💡 修正ポイント1: 呼び出し括弧 `()` を追加
     return Response(generate_progress(), content_type='text/event-stream')
 
 @app.route('/download')
@@ -294,9 +294,9 @@ async def download():
             async with httpx.AsyncClient(timeout=60.0) as client:
                 async with client.stream("GET", video_url) as r:
                     r.raise_for_status()
-                    async with r.iter_bytes(chunk_size=8192) as chunks: # 非同期イテレータの安全な呼び出し
-                        async for chunk in chunks:
-                            yield chunk
+                    # 💡 修正ポイント2: httpx の正しい非同期イテレータ呼び出し `aiter_bytes` に修正
+                    async for chunk in r.aiter_bytes(chunk_size=8192):
+                        yield chunk
 
         return Response(
             stream_with_context(stream_download()),
