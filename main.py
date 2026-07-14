@@ -278,7 +278,6 @@ async def analyze():
             else:
                 yield f'data: {{"type": "progress", "message": "{msg}"}}\n\n'
 
-    # 💡 修正ポイント1: 呼び出し括弧 `()` を追加
     return Response(generate_progress(), content_type='text/event-stream')
 
 @app.route('/download')
@@ -290,16 +289,18 @@ async def download():
     filename = pathlib.Path(urlparse(video_url).path).name or "video.mp4"
 
     try:
+        # Quartの stream_with_context 規格に完全に適合させた非同期ジェネレータ
+        @stream_with_context
         async def stream_download():
             async with httpx.AsyncClient(timeout=60.0) as client:
                 async with client.stream("GET", video_url) as r:
                     r.raise_for_status()
-                    # 💡 修正ポイント2: httpx の正しい非同期イテレータ呼び出し `aiter_bytes` に修正
                     async for chunk in r.aiter_bytes(chunk_size=8192):
                         yield chunk
 
+        # デコレータを正しく経由させた関数を Response に渡す
         return Response(
-            stream_with_context(stream_download()),
+            stream_download(),
             headers={
                 "Content-Disposition": f"attachment; filename={filename}",
                 "Content-Type": "video/mp4"
