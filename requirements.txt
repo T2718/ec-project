@@ -1,6 +1,7 @@
-flask
-gunicorn
-requests
+quart
+httpx
 beautifulsoup4
 selenium
 webdriver-manager
+gunicorn
+uvicorn
