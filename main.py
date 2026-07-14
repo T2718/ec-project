@@ -215,24 +215,22 @@ async def analyze():
     
     async def generate_progress():
         if not url:
-            yield f"data: {{\\"type\\": \\"error\\", \\"message\\": \\"URLが空です\\"}}\\n\\n"
+            # シングルクォーテーションで囲むことで、内部のダブルクォーテーションのエスケープを不要に
+            yield f'data: {{"type": "error", "message": "URLが空です"}}\n\n'
             return
 
         sitenameRe = r'^https?://([^/]+)'
         if not re.match(sitenameRe, url):
-            yield f"data: {{\\"type\\": \\"error\\", \\"message\\": \\"不正なURL構造です\\"}}\\n\\n"
+            yield f'data: {{"type": "error", "message": "不正なURL構造です"}}\n\n'
             return
 
         parsed_url = urlparse(url)
         sitename = parsed_url.netloc
         site = siteList.get(sitename, {'name': 'other'})
 
-        # 【追加】URL自体が動画ファイルを指しているか拡張子で判定
-        # もしくは siteList に未登録で、末尾が動画拡張子の場合は直接動画とみなす
         if parsed_url.path.lower().endswith(VIDEO_EXTENSIONS) or site['name'] == 'other':
-            # 念のため、siteListにない通常のWebページを弾きつつ、動画URLなら即パスする処理
             if parsed_url.path.lower().endswith(VIDEO_EXTENSIONS):
-                yield f"data: {{\\"type\\": \\"progress\\", \\"message\\": \\"⚡ 直接動画URLを検出しました。解析をスキップします...\\"}}\\n\\n"
+                yield f'data: {{"type": "progress", "message": "⚡ 直接動画URLを検出しました。解析をスキップします..."}}\n\n'
                 filename = pathlib.Path(parsed_url.path).name or "direct_video.mp4"
                 direct_data = {
                     'title': filename,
@@ -240,7 +238,7 @@ async def analyze():
                     'information': {'ファイル名': filename, 'タイプ': '直接動画リンク'}
                 }
                 import json
-                yield f"data: {{\\"type\\": \\"success\\", \\"data\\": {json.dumps(direct_data)}}}\\n\\n"
+                yield f'data: {{"type": "success", "data": {json.dumps(direct_data)}}}\n\n'
                 return
 
         # スレッドセーフな非同期キューで進捗メッセージを受け渡す
@@ -268,18 +266,18 @@ async def analyze():
         scraper_task = asyncio.create_task(run_scraper())
 
         # キューから進捗状況を取り出して逐次クライアントへ送信
-        while True:  # タイポ修正: true -> True
+        while True:
             msg = await queue.get()
             if isinstance(msg, tuple):
                 status_type, payload = msg
                 if status_type == 'SUCCESS':
                     import json
-                    yield f"data: {{\\"type\\": \\"success\\", \\"data\\": {json.dumps(payload)}}}\\n\\n"
+                    yield f'data: {{"type": "success", "data": {json.dumps(payload)}}}\n\n'
                 else:
-                    yield f"data: {{\\"type\\": \\"error\\", \\"message\\": \\"{payload}\\"}}\\n\\n"
+                    yield f'data: {{"type": "error", "message": "{payload}"}}\n\n'
                 break
             else:
-                yield f"data: {{\\"type\\": \\"progress\\", \\"message\\": \\"{msg}\\"}}\\n\\n"
+                yield f'data: {{"type": "progress", "message": "{msg}"}}\n\n'
 
     return Response(generate_progress(), content_type='text/event-stream')
 
