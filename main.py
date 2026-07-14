@@ -22,6 +22,9 @@ siteList = {
     'jp.spankbang.com': {'name': 'spank', 'code': 1}
 }
 
+# 直接ダウンロードを許可する一般的な動画拡張子
+VIDEO_EXTENSIONS = ('.mp4', '.m4v', '.webm', '.ogv', '.mov', '.avi', '.m3u8')
+
 def get_headless_driver():
     chrome_options = Options()
     chrome_options.add_argument('--headless')
@@ -37,7 +40,6 @@ def get_headless_driver():
 # 外部ブロックを防ぐため非同期でドライバーを実行
 async def getBySeleniumAsync(url, queue):
     await queue.put("⚙️ ヘッドレスChromeを起動中...")
-    # Seleniumのブロッキング処理を別スレッドで安全に実行
     loop = asyncio.get_event_loop()
     driver = await loop.run_in_executor(None, get_headless_driver)
     
@@ -125,7 +127,7 @@ HTML_TEMPLATE = """
 <body>
     <h2>🎬 EC動画解析 & ダウンロード (非同期)</h2>
     <div>
-        <input type="text" id="url-input" placeholder="動画のURLを入力（zozo / spankbang）" required>
+        <input type="text" id="url-input" placeholder="動画のURLを入力（zozo / spankbang / 直接動画URL）" required>
         <button type="button" id="start-btn">解析スタート</button>
     </div>
 
@@ -144,7 +146,6 @@ HTML_TEMPLATE = """
             progressBox.innerText = '🚀 サーバーへ解析要求を送信中...';
             resultContainer.innerHTML = '';
 
-            // SSE を利用して進行状況のテキストをストリーミング受信
             const eventSource = new EventSource('/analyze?url=' + encodeURIComponent(url));
 
             eventSource.onmessage = function(event) {
@@ -222,8 +223,25 @@ async def analyze():
             yield f"data: {{\\"type\\": \\"error\\", \\"message\\": \\"不正なURL構造です\\"}}\\n\\n"
             return
 
-        sitename = re.match(sitenameRe, url).group(1)
+        parsed_url = urlparse(url)
+        sitename = parsed_url.netloc
         site = siteList.get(sitename, {'name': 'other'})
+
+        # 【追加】URL自体が動画ファイルを指しているか拡張子で判定
+        # もしくは siteList に未登録で、末尾が動画拡張子の場合は直接動画とみなす
+        if parsed_url.path.lower().endswith(VIDEO_EXTENSIONS) or site['name'] == 'other':
+            # 念のため、siteListにない通常のWebページを弾きつつ、動画URLなら即パスする処理
+            if parsed_url.path.lower().endswith(VIDEO_EXTENSIONS):
+                yield f"data: {{\\"type\\": \\"progress\\", \\"message\\": \\"⚡ 直接動画URLを検出しました。解析をスキップします...\\"}}\\n\\n"
+                filename = pathlib.Path(parsed_url.path).name or "direct_video.mp4"
+                direct_data = {
+                    'title': filename,
+                    'video_url': url,
+                    'information': {'ファイル名': filename, 'タイプ': '直接動画リンク'}
+                }
+                import json
+                yield f"data: {{\\"type\\": \\"success\\", \\"data\\": {json.dumps(direct_data)}}}\\n\\n"
+                return
 
         # スレッドセーフな非同期キューで進捗メッセージを受け渡す
         queue = asyncio.Queue()
@@ -250,7 +268,7 @@ async def analyze():
         scraper_task = asyncio.create_task(run_scraper())
 
         # キューから進捗状況を取り出して逐次クライアントへ送信
-        while true:
+        while True:  # タイポ修正: true -> True
             msg = await queue.get()
             if isinstance(msg, tuple):
                 status_type, payload = msg
@@ -274,13 +292,13 @@ async def download():
     filename = pathlib.Path(urlparse(video_url).path).name or "video.mp4"
 
     try:
-        # ダウンロード側も非同期の httpx を用いてストリーミング配信
         async def stream_download():
             async with httpx.AsyncClient(timeout=60.0) as client:
                 async with client.stream("GET", video_url) as r:
                     r.raise_for_status()
-                    async for chunk in r.iter_bytes(chunk_size=8192):
-                        yield chunk
+                    async with r.iter_bytes(chunk_size=8192) as chunks: # 非同期イテレータの安全な呼び出し
+                        async for chunk in chunks:
+                            yield chunk
 
         return Response(
             stream_with_context(stream_download()),
