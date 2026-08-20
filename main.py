@@ -288,24 +288,48 @@ async def download():
 
     filename = pathlib.Path(urlparse(video_url).path).name or "video.mp4"
 
+    # 動画配信サーバーのブロックを回避するための汎用ヘッダー
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": video_url
+    }
+
+    # 接続・読み込みのタイムアウトを無制限に設定（読み込みが止まるのを防ぐ）
+    timeout = httpx.Timeout(connect=15.0, read=None, write=None, pool=None)
+
     try:
-        # Quartの stream_with_context 規格に完全に適合させた非同期ジェネレータ
+        # httpxのクライアントを生成してレスポンスヘッダーを取得
+        client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        req = client.build_request("GET", video_url, headers=headers)
+        r = await client.send(req, stream=True)
+        r.raise_for_status()
+
         @stream_with_context
         async def stream_download():
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                async with client.stream("GET", video_url) as r:
-                    r.raise_for_status()
-                    async for chunk in r.aiter_bytes(chunk_size=8192):
-                        yield chunk
+            try:
+                # チャンクサイズを64KBに拡張（8KBだと小さすぎてオーバーヘッドが大きい）
+                async for chunk in r.aiter_bytes(chunk_size=65536):
+                    yield chunk
+            finally:
+                # 通信終了時に確実にクライアントとレスポンスを閉じる
+                await r.aclose()
+                await client.aclose()
 
-        # デコレータを正しく経由させた関数を Response に渡す
+        # レスポンスヘッダーの構築
+        response_headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": r.headers.get("Content-Type", "video/mp4")
+        }
+
+        # 元サーバーから Content-Length が取得できればブラウザに渡す（進捗バーが正しく表示されます）
+        if "Content-Length" in r.headers:
+            response_headers["Content-Length"] = r.headers["Content-Length"]
+
         return Response(
             stream_download(),
-            headers={
-                "Content-Disposition": f"attachment; filename={filename}",
-                "Content-Type": "video/mp4"
-            }
+            headers=response_headers
         )
+
     except Exception as e:
         return f"ダウンロードエラー: {e}", 500
 
