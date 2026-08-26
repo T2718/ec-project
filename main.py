@@ -4,6 +4,7 @@ import ast
 import pathlib
 import datetime
 import asyncio
+import json
 from urllib.parse import urlparse
 from quart import Quart, request, render_template_string, Response, stream_with_context
 import httpx
@@ -212,73 +213,83 @@ async def index():
 @app.route('/analyze')
 async def analyze():
     url = request.args.get('url', '').strip()
-    
+
+    def sse(event_type, **kwargs):
+        """SSEペイロードを安全に組み立てる（json.dumpsで必ずエスケープ）"""
+        payload = {"type": event_type, **kwargs}
+        return f'data: {json.dumps(payload, ensure_ascii=False)}\n\n'
+
     async def generate_progress():
-        if not url:
-            yield f'data: {{"type": "error", "message": "URLが空です"}}\n\n'
-            return
+        try:
+            if not url:
+                yield sse("error", message="URLが空です")
+                return
 
-        sitenameRe = r'^https?://([^/]+)'
-        if not re.match(sitenameRe, url):
-            yield f'data: {{"type": "error", "message": "不正なURL構造です"}}\n\n'
-            return
+            if not re.match(r'^https?://([^/]+)', url):
+                yield sse("error", message="不正なURL構造です")
+                return
 
-        parsed_url = urlparse(url)
-        sitename = parsed_url.netloc
-        site = siteList.get(sitename, {'name': 'other'})
+            parsed_url = urlparse(url)
+            sitename = parsed_url.netloc
+            site = siteList.get(sitename, {'name': 'other'})
 
-        if parsed_url.path.lower().endswith(VIDEO_EXTENSIONS) or site['name'] == 'other':
             if parsed_url.path.lower().endswith(VIDEO_EXTENSIONS):
-                yield f'data: {{"type": "progress", "message": "⚡ 直接動画URLを検出しました。解析をスキップします..."}}\n\n'
+                yield sse("progress", message="⚡ 直接動画URLを検出しました。解析をスキップします...")
                 filename = pathlib.Path(parsed_url.path).name or "direct_video.mp4"
                 direct_data = {
                     'title': filename,
                     'video_url': url,
                     'information': {'ファイル名': filename, 'タイプ': '直接動画リンク'}
                 }
-                import json
-                yield f'data: {{"type": "success", "data": {json.dumps(direct_data)}}}\n\n'
+                yield sse("success", data=direct_data)
                 return
 
-        # スレッドセーフな非同期キューで進捗メッセージを受け渡す
-        queue = asyncio.Queue()
+            queue = asyncio.Queue()
 
-        async def run_scraper():
-            try:
-                html_text = await getBySeleniumAsync(url, queue)
-                await queue.put("🔍 解析用スープを作成中 (BeautifulSoup)...")
-                soup = BeautifulSoup(html_text, 'html.parser')
-                
-                await queue.put("⚡ ターゲットデータを抽出中...")
-                if site['name'] == 'zozo':
-                    data = getZozo(soup)
-                elif site['name'] == 'spank':
-                    data = getSpank(soup)
+            async def run_scraper():
+                try:
+                    html_text = await getBySeleniumAsync(url, queue)
+                    await queue.put("🔍 解析用スープを作成中 (BeautifulSoup)...")
+                    soup = BeautifulSoup(html_text, 'html.parser')
+
+                    await queue.put("⚡ ターゲットデータを抽出中...")
+                    if site['name'] == 'zozo':
+                        data = getZozo(soup)
+                    elif site['name'] == 'spank':
+                        data = getSpank(soup)
+                    else:
+                        data = {'title': 'Unknown', 'status': ['Unsupported site']}
+
+                    await queue.put(('SUCCESS', data))
+                except Exception as e:
+                    await queue.put(('ERROR', str(e)))
+
+            asyncio.create_task(run_scraper())
+
+            while True:
+                msg = await queue.get()
+                if isinstance(msg, tuple):
+                    status_type, payload = msg
+                    if status_type == 'SUCCESS':
+                        yield sse("success", data=payload)
+                    else:
+                        yield sse("error", message=payload)
+                    break
                 else:
-                    data = {'title': 'Unknown', 'status': ['Unsupported site']}
-                
-                await queue.put(('SUCCESS', data))
-            except Exception as e:
-                await queue.put(('ERROR', str(e)))
+                    yield sse("progress", message=msg)
 
-        # スクレイピングタスクをバックグラウンドで開始
-        scraper_task = asyncio.create_task(run_scraper())
+        except Exception as e:
+            # ここが無いと、例外発生時に接続がそのまま切れて
+            # ブラウザ側は「通信エラー」としか表示できない
+            yield sse("error", message=f"サーバー内部エラー: {e}")
 
-        # キューから進捗状況を取り出して逐次クライアントへ送信
-        while True:
-            msg = await queue.get()
-            if isinstance(msg, tuple):
-                status_type, payload = msg
-                if status_type == 'SUCCESS':
-                    import json
-                    yield f'data: {{"type": "success", "data": {json.dumps(payload)}}}\n\n'
-                else:
-                    yield f'data: {{"type": "error", "message": "{payload}"}}\n\n'
-                break
-            else:
-                yield f'data: {{"type": "progress", "message": "{msg}"}}\n\n'
-
-    return Response(generate_progress(), content_type='text/event-stream')
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",  # nginx等のリバースプロキシ配下で使う場合のバッファ無効化
+    }
+    return Response(generate_progress(), headers=headers)
 
 @app.route('/download')
 async def download():
