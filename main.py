@@ -1,10 +1,10 @@
 import os
 import re
 import ast
-import pathlib
-import datetime
-import asyncio
 import json
+import pathlib
+import itertools
+import asyncio
 from urllib.parse import urlparse
 from quart import Quart, request, render_template_string, Response, stream_with_context
 import httpx
@@ -26,6 +26,11 @@ siteList = {
 # 直接ダウンロードを許可する一般的な動画拡張子
 VIDEO_EXTENSIONS = ('.mp4', '.m4v', '.webm', '.ogv', '.mov', '.avi', '.m3u8')
 
+FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
+
+
 def get_headless_driver():
     chrome_options = Options()
     chrome_options.add_argument('--headless')
@@ -33,27 +38,29 @@ def get_headless_driver():
     chrome_options.add_argument('--disable-dev-shm-usage')
     chrome_options.add_argument('--disable-gpu')
     chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-    
+
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
     return driver
+
 
 # 外部ブロックを防ぐため非同期でドライバーを実行
 async def getBySeleniumAsync(url, queue):
     await queue.put("⚙️ ヘッドレスChromeを起動中...")
     loop = asyncio.get_event_loop()
     driver = await loop.run_in_executor(None, get_headless_driver)
-    
+
     try:
         await queue.put(f"🌐 ターゲットサイトに接続中: {url}")
         await loop.run_in_executor(None, driver.get, url)
-        
+
         await queue.put("📄 ページのレンダリング完了。HTMLを抽出しています...")
         html = await loop.run_in_executor(None, lambda: driver.page_source)
     finally:
         await queue.put("🧹 ブラウザを安全に閉じています...")
         await loop.run_in_executor(None, driver.quit)
     return html
+
 
 def getZozo(soup):
     result = {'title': 'Unknown', 'status': [], 'information': {}}
@@ -79,6 +86,7 @@ def getZozo(soup):
                     result['title'] = value_text
     return result
 
+
 def getSpank(soup):
     result = {'title': 'Unknown', 'status': [], 'information': {}}
     main = soup.find('main')
@@ -95,127 +103,711 @@ def getSpank(soup):
                     result['video_url'] = urls['main'][0]
                 if 'cover_image' in urls:
                     result['poster_url'] = urls['cover_image']
-            except:
+            except Exception:
                 result['status'].append("Can't parse stream_data")
     video = soup.find(id='video')
     if video and video.find('h1'):
         result['title'] = video.find('h1').text.strip()
     return result
 
-# --- WEB UI (リアルタイム進捗対応) ---
+
+# --- 開発パネル用: HTML → 階層JSON変換 ---
+
+def _attrs_to_dict(node):
+    attrs = {}
+    for k, v in (node.attrs or {}).items():
+        if isinstance(v, list):
+            v = ' '.join(v)
+        attrs[k] = v
+    return attrs
+
+
+def parse_html_to_tree(html_text):
+    """HTMLをパースし、id付きの階層JSONツリーへ変換する"""
+    soup = BeautifulSoup(html_text, 'html.parser')
+    counter = itertools.count(0)
+
+    def build(node):
+        if not hasattr(node, 'name') or node.name is None:
+            return None
+        node_id = next(counter)
+        own_text_parts = []
+        children = []
+        for child in node.children:
+            if isinstance(child, str):
+                t = child.strip()
+                if t:
+                    own_text_parts.append(t)
+            else:
+                built = build(child)
+                if built:
+                    children.append(built)
+        return {
+            'id': node_id,
+            'tag': node.name,
+            'attrs': _attrs_to_dict(node),
+            'text': ' '.join(own_text_parts)[:300],
+            'children': children,
+        }
+
+    root_children = []
+    for child in soup.children:
+        if not isinstance(child, str):
+            built = build(child)
+            if built:
+                root_children.append(built)
+
+    return {'id': -1, 'tag': '#document', 'attrs': {}, 'text': '', 'children': root_children}
+
+
+def find_selector_ids(html_text, selector):
+    """同一のsoupインスタンス内でCSSセレクタ一致要素とツリーidの対応を取る"""
+    soup = BeautifulSoup(html_text, 'html.parser')
+    counter = itertools.count(0)
+
+    matched_objs = set()
+    for el in soup.select(selector):
+        matched_objs.add(id(el))
+
+    matched_ids = []
+
+    def walk(node):
+        if not hasattr(node, 'name') or node.name is None:
+            return
+        node_id = next(counter)
+        if id(node) in matched_objs:
+            matched_ids.append(node_id)
+        for child in node.children:
+            if not isinstance(child, str):
+                walk(child)
+
+    for child in soup.children:
+        if not isinstance(child, str):
+            walk(child)
+
+    return matched_ids
+
+
+# --- WEB UI ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ja">
-<head>
+  <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>EC Video Helper</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; background: #f9f9f9; }
-        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-top: 20px; }
-        input[type="text"] { width: 100%; padding: 10px; box-sizing: border-box; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; }
-        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; width: 100%; font-size: 16px; }
-        button:hover { background: #0056b3; }
-        .download-btn { background: #28a745; margin-top: 15px; display: inline-block; text-align: center; text-decoration: none; color: white; padding: 12px; border-radius: 4px; width: 100%; box-sizing: border-box; font-weight: bold; }
-        .download-btn:hover { background: #218838; }
-        #progress-box { display: none; background: #e9ecef; border-left: 4px solid #007bff; padding: 12px; margin-top: 20px; border-radius: 4px; font-size: 14px; color: #495057; }
-        #result-container { margin-top: 20px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        th { background: #f2f2f2; }
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 600px;
+        margin: 40px auto;
+        padding: 20px;
+        background: #f9f9f9;
+      }
+      .card {
+        background: white;
+        padding: 20px;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        margin-top: 20px;
+      }
+      input[type="text"] {
+        width: 100%;
+        padding: 10px;
+        box-sizing: border-box;
+        margin-bottom: 10px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+      }
+      button {
+        background: #007bff;
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 4px;
+        cursor: pointer;
+        width: 100%;
+        font-size: 16px;
+      }
+      button:hover {
+        background: #0056b3;
+      }
+      .download-btn {
+        background: #28a745;
+        margin-top: 15px;
+        display: inline-block;
+        text-align: center;
+        text-decoration: none;
+        color: white;
+        padding: 12px;
+        border-radius: 4px;
+        width: 100%;
+        box-sizing: border-box;
+        font-weight: bold;
+      }
+      .download-btn:hover {
+        background: #218838;
+      }
+      #progress-box {
+        display: none;
+        background: #e9ecef;
+        border-left: 4px solid #007bff;
+        padding: 12px;
+        margin-top: 20px;
+        border-radius: 4px;
+        font-size: 14px;
+        color: #495057;
+      }
+      #result-container {
+        margin-top: 20px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 10px;
+      }
+      th, td {
+        border: 1px solid #ddd;
+        padding: 8px;
+        text-align: left;
+      }
+      th {
+        background: #f2f2f2;
+      }
+
+      /* ===== 開発パネル ===== */
+      #dev-btn {
+        position: fixed;
+        top: 10px;
+        left: 10px;
+        z-index: 2000;
+        width: auto;
+        padding: 8px 14px;
+        background: #343a40;
+        font-size: 14px;
+        border-radius: 4px;
+      }
+      #dev-btn:hover {
+        background: #23272b;
+      }
+      #dev-panel {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.5);
+        z-index: 3000;
+        align-items: center;
+        justify-content: center;
+      }
+      .dev-panel-inner {
+        background: #fff;
+        width: 95%;
+        height: 90%;
+        max-width: 1100px;
+        border-radius: 8px;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      .dev-header {
+        display: flex;
+        gap: 8px;
+        padding: 12px;
+        border-bottom: 1px solid #ddd;
+        align-items: center;
+      }
+      .dev-header input[type="text"] {
+        flex: 1;
+        margin: 0;
+      }
+      .dev-header button {
+        width: auto;
+        padding: 8px 14px;
+        white-space: nowrap;
+      }
+      .dev-close-btn {
+        background: #6c757d;
+      }
+      .dev-close-btn:hover {
+        background: #545b62;
+      }
+      .dev-status {
+        padding: 4px 12px;
+        font-size: 13px;
+        color: #555;
+        min-height: 20px;
+      }
+      .dev-search-bar {
+        display: flex;
+        gap: 8px;
+        padding: 8px 12px;
+        border-bottom: 1px solid #ddd;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .dev-search-bar select {
+        padding: 6px;
+        border-radius: 4px;
+        border: 1px solid #ccc;
+      }
+      .dev-search-bar input[type="text"] {
+        flex: 1;
+        min-width: 150px;
+        margin: 0;
+        padding: 6px;
+      }
+      .dev-search-bar button {
+        width: auto;
+        padding: 6px 12px;
+        font-size: 13px;
+      }
+      #search-counter {
+        font-size: 13px;
+        color: #333;
+        min-width: 60px;
+        text-align: center;
+      }
+      .tree-container {
+        flex: 1;
+        overflow: auto;
+        padding: 10px 14px;
+        font-family: "Consolas", "Menlo", monospace;
+        font-size: 13px;
+        background: #fafafa;
+      }
+      .tree-node {
+        margin-left: 16px;
+      }
+      .tree-node:first-child {
+        margin-left: 0;
+      }
+      .node-line {
+        cursor: pointer;
+        padding: 1px 4px;
+        border-radius: 3px;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .node-line:hover {
+        background: #eef2f7;
+      }
+      .toggle {
+        display: inline-block;
+        width: 14px;
+        color: #888;
+      }
+      .tag-open {
+        color: #0b5394;
+      }
+      .attr-name {
+        color: #a52a2a;
+      }
+      .attr-value {
+        color: #1a7a1a;
+      }
+      .node-text {
+        color: #333;
+        margin-left: 6px;
+      }
+      .children {
+        margin-left: 4px;
+        border-left: 1px dashed #ccc;
+        padding-left: 6px;
+      }
+      .hl-line {
+        background: #fff3a0 !important;
+      }
+      .active-match {
+        outline: 2px solid #ff6600;
+        background: #ffd580 !important;
+      }
     </style>
-</head>
-<body>
+  </head>
+  <body>
+    <button id="dev-btn" type="button" onclick="openDevPanel()">🛠 開発</button>
+
+    <div id="dev-panel">
+      <div class="dev-panel-inner">
+        <div class="dev-header">
+          <input type="text" id="dev-url-input" placeholder="解析したいURLを入力">
+          <button type="button" onclick="fetchInspect()">取得</button>
+          <button type="button" class="dev-close-btn" onclick="closeDevPanel()">✕ 閉じる</button>
+        </div>
+        <div id="dev-status" class="dev-status"></div>
+
+        <div class="dev-search-bar">
+          <select id="search-mode">
+            <option value="tag">タグ名</option>
+            <option value="text">文字列</option>
+            <option value="selector">CSSクエリ</option>
+          </select>
+          <input type="text" id="search-input" placeholder="検索キーワード / セレクタ (例: div.title, #video)" onkeydown="if(event.key==='Enter'){ runSearch(); }">
+          <button type="button" onclick="runSearch()">検索</button>
+          <button type="button" onclick="gotoMatch(matchIndex - 1)">◀ 前へ</button>
+          <span id="search-counter">0 / 0</span>
+          <button type="button" onclick="gotoMatch(matchIndex + 1)">次へ ▶</button>
+        </div>
+
+        <div id="tree-container" class="tree-container"></div>
+      </div>
+    </div>
+
     <h2>🎬 EC動画解析 & ダウンロード (非同期)</h2>
     <div>
-        <input type="text" id="url-input" placeholder="動画のURLを入力（zozo / spankbang / 直接動画URL）" required>
-        <button type="button" id="start-btn">解析スタート</button>
+      <input type="text" id="url-input" placeholder="動画のURLを入力（zozo / spankbang / 直接動画URL）" required>
+      <button type="button" id="start-btn">解析スタート</button>
     </div>
 
     <div id="progress-box">⏳ 進捗ステータス待ち...</div>
     <div id="result-container"></div>
 
     <script>
-        document.getElementById('start-btn').addEventListener('click', function() {
-            const url = document.getElementById('url-input').value.trim();
-            if (!url) return alert('URLを入力してください');
+      // ===================== メイン解析機能 =====================
+      document.getElementById('start-btn').addEventListener('click', function () {
+        const url = document.getElementById('url-input').value.trim();
+        if (!url) return alert('URLを入力してください');
 
-            const progressBox = document.getElementById('progress-box');
-            const resultContainer = document.getElementById('result-container');
-            
-            progressBox.style.display = 'block';
-            progressBox.innerText = '🚀 サーバーへ解析要求を送信中...';
-            resultContainer.innerHTML = '';
+        const progressBox = document.getElementById('progress-box');
+        const resultContainer = document.getElementById('result-container');
 
-            const eventSource = new EventSource('/analyze?url=' + encodeURIComponent(url));
+        progressBox.style.display = 'block';
+        progressBox.innerText = '🚀 サーバーへ解析要求を送信中...';
+        resultContainer.innerHTML = '';
 
-            eventSource.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-                
-                if (data.type === 'progress') {
-                    progressBox.innerText = data.message;
-                } 
-                else if (data.type === 'success') {
-                    progressBox.innerText = '✅ 解析が完了しました！';
-                    renderResult(data.data, url);
-                    eventSource.close();
-                } 
-                else if (data.type === 'error') {
-                    progressBox.style.display = 'none';
-                    resultContainer.innerHTML = `<div class="card" style="color: red;">❌ エラー: ${data.message}</div>`;
-                    eventSource.close();
-                }
-            };
+        const eventSource = new EventSource('/analyze?url=' + encodeURIComponent(url));
 
-            eventSource.onerror = function() {
-                progressBox.innerText = '⚠️ 通信中にエラーが発生しました。';
-                eventSource.close();
-            };
+        eventSource.onmessage = function (event) {
+          const data = JSON.parse(event.data);
+
+          if (data.type === 'progress') {
+            progressBox.innerText = data.message;
+          } else if (data.type === 'success') {
+            progressBox.innerText = '✅ 解析が完了しました！';
+            renderResult(data.data, url);
+            eventSource.close();
+          } else if (data.type === 'error') {
+            progressBox.style.display = 'none';
+            resultContainer.innerHTML = `<div class="card" style="color: red;">❌ エラー: ${data.message}</div>`;
+            eventSource.close();
+          }
+        };
+
+        eventSource.onerror = function () {
+          progressBox.innerText = '⚠️ 通信中にエラーが発生しました。';
+          eventSource.close();
+        };
+      });
+
+      function renderResult(data, originalUrl) {
+        let infoRows = '';
+        if (data.information) {
+          for (const [k, v] of Object.entries(data.information)) {
+            infoRows += `<tr><th>${k}</th><td>${v}</td></tr>`;
+          }
+        }
+
+        let html = `
+          <div class="card">
+            <h3>🎵 ${data.title || 'タイトル不明'}</h3>
+            ${infoRows ? `<h4>📋 作品情報</h4><table>${infoRows}</table>` : ''}
+            <h4>🔗 リンク</h4>
+            <p>・元ページ: <a href="${originalUrl}" target="_blank">${originalUrl}</a></p>
+        `;
+
+        if (data.video_url) {
+          html += `
+            <p>・直接動画: <a href="${data.video_url}" target="_blank">ブラウザで動画を開く</a></p>
+            <a class="download-btn" href="/download?video_url=${encodeURIComponent(data.video_url)}">📥 この動画をダウンロード (MP4保存)</a>
+          `;
+        } else {
+          html += `<p style="color: orange;">⚠️ 動画URLの解析に失敗したか、ページ内に見つかりませんでした。</p>`;
+        }
+
+        html += `</div>`;
+        document.getElementById('result-container').innerHTML = html;
+      }
+
+      // ===================== 開発パネル機能 =====================
+      let currentTree = null;
+      let currentHtml = '';
+      let idParentMap = {};
+      let idNodeMap = {};
+      let matches = [];
+      let matchIndex = -1;
+
+      function openDevPanel() {
+        document.getElementById('dev-panel').style.display = 'flex';
+      }
+
+      function closeDevPanel() {
+        document.getElementById('dev-panel').style.display = 'none';
+      }
+
+      function escapeHtml(str) {
+        return String(str)
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;');
+      }
+
+      function renderAttrs(attrs) {
+        return Object.entries(attrs)
+          .map(([k, v]) => ` <span class="attr-name">${escapeHtml(k)}</span>=<span class="attr-value">"${escapeHtml(v)}"</span>`)
+          .join('');
+      }
+
+      function renderNode(node) {
+        const hasChildren = node.children.length > 0;
+        const toggleChar = hasChildren ? '▶' : '　';
+        const attrsHtml = renderAttrs(node.attrs);
+        const textHtml = node.text ? `<span class="node-text">${escapeHtml(node.text)}</span>` : '';
+        const childrenHtml = node.children.map(renderNode).join('');
+        return `
+          <div class="tree-node" id="node-${node.id}">
+            <div class="node-line" onclick="toggleNode(event)">
+              <span class="toggle">${toggleChar}</span>
+              <span class="tag-open">&lt;${escapeHtml(node.tag)}${attrsHtml}&gt;</span>
+              ${textHtml}
+            </div>
+            <div class="children" style="display:none;">
+              ${childrenHtml}
+            </div>
+          </div>`;
+      }
+
+      function toggleNode(event) {
+        event.stopPropagation();
+        const line = event.currentTarget;
+        const wrapper = line.parentElement;
+        const childrenBox = wrapper.querySelector(':scope > .children');
+        const toggle = line.querySelector('.toggle');
+        if (!childrenBox || childrenBox.children.length === 0) return;
+        const isOpen = childrenBox.style.display !== 'none';
+        childrenBox.style.display = isOpen ? 'none' : 'block';
+        if (toggle.textContent.trim()) {
+          toggle.textContent = isOpen ? '▶' : '▼';
+        }
+      }
+
+      function buildMaps(node, parentId) {
+        idNodeMap[node.id] = node;
+        idParentMap[node.id] = parentId;
+        node.children.forEach(c => buildMaps(c, node.id));
+      }
+
+      async function fetchInspect() {
+        const url = document.getElementById('dev-url-input').value.trim();
+        const statusEl = document.getElementById('dev-status');
+        const treeContainer = document.getElementById('tree-container');
+        if (!url) return alert('URLを入力してください');
+
+        statusEl.textContent = '⏳ 取得中...';
+        treeContainer.innerHTML = '';
+        matches = [];
+        matchIndex = -1;
+        idParentMap = {};
+        idNodeMap = {};
+        updateCounter();
+
+        try {
+          const res = await fetch('/inspect/fetch?url=' + encodeURIComponent(url));
+          const data = await res.json();
+          if (!data.ok) {
+            statusEl.textContent = '❌ ' + data.message;
+            return;
+          }
+          currentTree = data.tree;
+          currentHtml = data.html;
+          currentTree.children.forEach(c => buildMaps(c, -1));
+          treeContainer.innerHTML = currentTree.children.map(renderNode).join('');
+          statusEl.textContent = '✅ 取得完了（要素数: ' + Object.keys(idNodeMap).length + '）';
+        } catch (e) {
+          statusEl.textContent = '❌ 通信エラー: ' + e;
+        }
+      }
+
+      function nodeMatchesTag(node, q) {
+        return node.tag.toLowerCase() === q.toLowerCase();
+      }
+
+      function nodeMatchesText(node, q) {
+        const ql = q.toLowerCase();
+        if (node.tag.toLowerCase().includes(ql)) return true;
+        if (node.text && node.text.toLowerCase().includes(ql)) return true;
+        for (const k in node.attrs) {
+          if (k.toLowerCase().includes(ql)) return true;
+          if (String(node.attrs[k]).toLowerCase().includes(ql)) return true;
+        }
+        return false;
+      }
+
+      function collectMatches(node, predicate, out) {
+        if (predicate(node)) out.push(node.id);
+        node.children.forEach(c => collectMatches(c, predicate, out));
+      }
+
+      async function queryBySelector(selector) {
+        try {
+          const res = await fetch('/inspect/query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ html: currentHtml, selector: selector })
+          });
+          const data = await res.json();
+          if (!data.ok) {
+            alert(data.message || 'クエリエラー');
+            return [];
+          }
+          return data.matched_ids;
+        } catch (e) {
+          alert('クエリ通信エラー: ' + e);
+          return [];
+        }
+      }
+
+      function clearHighlights() {
+        document.querySelectorAll('.hl-line').forEach(el => el.classList.remove('hl-line'));
+        document.querySelectorAll('.active-match').forEach(el => el.classList.remove('active-match'));
+      }
+
+      function updateCounter() {
+        const el = document.getElementById('search-counter');
+        if (matches.length === 0) {
+          el.textContent = '0 / 0';
+          return;
+        }
+        el.textContent = (matchIndex + 1) + ' / ' + matches.length;
+      }
+
+      async function runSearch() {
+        if (!currentTree) return alert('先にURLを取得してください');
+        const mode = document.getElementById('search-mode').value;
+        const q = document.getElementById('search-input').value.trim();
+
+        clearHighlights();
+        matches = [];
+        matchIndex = -1;
+
+        if (!q) {
+          updateCounter();
+          return;
+        }
+
+        let ids = [];
+        if (mode === 'tag') {
+          collectMatches(currentTree, n => nodeMatchesTag(n, q), ids);
+        } else if (mode === 'text') {
+          collectMatches(currentTree, n => nodeMatchesText(n, q), ids);
+        } else if (mode === 'selector') {
+          ids = await queryBySelector(q);
+        }
+
+        matches = ids;
+        matches.forEach(id => {
+          const line = document.querySelector('#node-' + id + ' > .node-line');
+          if (line) line.classList.add('hl-line');
         });
 
-        function renderResult(data, originalUrl) {
-            let infoRows = '';
-            if (data.information) {
-                for (const [k, v] of Object.entries(data.information)) {
-                    infoRows += `<tr><th>${k}</th><td>${v}</td></tr>`;
-                }
-            }
+        updateCounter();
+        if (matches.length > 0) gotoMatch(0);
+      }
 
-            let html = `
-                <div class="card">
-                    <h3>🎵 ${data.title || 'タイトル不明'}</h3>
-                    ${infoRows ? `<h4>📋 作品情報</h4><table>${infoRows}</table>` : ''}
-                    <h4>🔗 リンク</h4>
-                    <p>・元ページ: <a href="${originalUrl}" target="_blank">${originalUrl}</a></p>
-            `;
+      function gotoMatch(i) {
+        if (matches.length === 0) return;
 
-            if (data.video_url) {
-                html += `
-                    <p>・直接動画: <a href="${data.video_url}" target="_blank">ブラウザで動画を開く</a></p>
-                    <a class="download-btn" href="/download?video_url=${encodeURIComponent(data.video_url)}">📥 この動画をダウンロード (MP4保存)</a>
-                `;
-            } else {
-                html += `<p style="color: orange;">⚠️ 動画URLの解析に失敗したか、ページ内に見つかりませんでした。</p>`;
-            }
+        const prevActive = document.querySelector('.active-match');
+        if (prevActive) prevActive.classList.remove('active-match');
 
-            html += `</div>`;
-            document.getElementById('result-container').innerHTML = html;
+        matchIndex = ((i % matches.length) + matches.length) % matches.length;
+        const id = matches[matchIndex];
+
+        // 祖先を展開して表示状態にする
+        let pid = idParentMap[id];
+        while (pid !== undefined && pid !== -1) {
+          const parentEl = document.getElementById('node-' + pid);
+          if (parentEl) {
+            const childrenBox = parentEl.querySelector(':scope > .children');
+            const toggle = parentEl.querySelector(':scope > .node-line > .toggle');
+            if (childrenBox) childrenBox.style.display = 'block';
+            if (toggle && toggle.textContent === '▶') toggle.textContent = '▼';
+          }
+          pid = idParentMap[pid];
         }
+
+        const line = document.querySelector('#node-' + id + ' > .node-line');
+        if (line) {
+          line.classList.add('active-match');
+          line.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+        updateCounter();
+      }
     </script>
-</body>
+  </body>
 </html>
 """
+
 
 @app.route('/')
 async def index():
     return await render_template_string(HTML_TEMPLATE)
+
+
+# --- 開発パネル用エンドポイント ---
+
+@app.route('/inspect/fetch')
+async def inspect_fetch():
+    url = request.args.get('url', '').strip()
+    if not url:
+        return {'ok': False, 'message': 'URLが空です'}, 400
+    if not re.match(r'^https?://', url):
+        return {'ok': False, 'message': '不正なURLです（http/httpsのみ対応）'}, 400
+
+    timeout = httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=15.0)
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            r = await client.get(url, headers=FETCH_HEADERS)
+            r.raise_for_status()
+            html_text = r.text
+    except httpx.ConnectError as e:
+        return {'ok': False, 'message': f'接続失敗: {e}'}, 502
+    except httpx.HTTPStatusError as e:
+        return {'ok': False, 'message': f'サーバーがエラーを返しました: {e.response.status_code}'}, 502
+    except Exception as e:
+        return {'ok': False, 'message': f'取得エラー: {e}'}, 500
+
+    tree = parse_html_to_tree(html_text)
+    return {'ok': True, 'html': html_text, 'tree': tree}
+
+
+@app.route('/inspect/query', methods=['POST'])
+async def inspect_query():
+    data = await request.get_json(silent=True) or {}
+    html_text = data.get('html', '')
+    selector = (data.get('selector') or '').strip()
+
+    if not html_text or not selector:
+        return {'ok': False, 'message': 'htmlまたはselectorが空です'}, 400
+
+    try:
+        matched_ids = find_selector_ids(html_text, selector)
+    except Exception as e:
+        return {'ok': False, 'message': f'セレクタが不正です: {e}'}, 400
+
+    return {'ok': True, 'matched_ids': matched_ids}
+
+
+# --- 動画解析 ---
 
 @app.route('/analyze')
 async def analyze():
     url = request.args.get('url', '').strip()
 
     def sse(event_type, **kwargs):
-        """SSEペイロードを安全に組み立てる（json.dumpsで必ずエスケープ）"""
         payload = {"type": event_type, **kwargs}
         return f'data: {json.dumps(payload, ensure_ascii=False)}\n\n'
 
@@ -279,17 +871,16 @@ async def analyze():
                     yield sse("progress", message=msg)
 
         except Exception as e:
-            # ここが無いと、例外発生時に接続がそのまま切れて
-            # ブラウザ側は「通信エラー」としか表示できない
             yield sse("error", message=f"サーバー内部エラー: {e}")
 
     headers = {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",  # nginx等のリバースプロキシ配下で使う場合のバッファ無効化
+        "X-Accel-Buffering": "no",
     }
     return Response(generate_progress(), headers=headers)
+
 
 @app.route('/download')
 async def download():
@@ -300,40 +891,26 @@ async def download():
     filename = pathlib.Path(urlparse(video_url).path).name or "video.mp4"
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": video_url
+        **FETCH_HEADERS,
+        "Referer": video_url,
     }
 
     timeout = httpx.Timeout(connect=15.0, read=None, write=None, pool=None)
-
-    # IPv6ルートが無い環境でのAll connection attempts failed対策として
-    # IPv4を明示的に優先させるtransportを使う
     transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
 
     client = None
     r = None
     try:
-        client = httpx.AsyncClient(
-            timeout=timeout,
-            follow_redirects=True,
-            transport=transport,
-        )
+        client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, transport=transport)
         req = client.build_request("GET", video_url, headers=headers)
         r = await client.send(req, stream=True)
         r.raise_for_status()
-
     except httpx.ConnectError as e:
-        # 接続自体が失敗した場合。原因切り分け用に詳細を出す
         if r:
             await r.aclose()
         if client:
             await client.aclose()
-        return (
-            f"接続失敗: {video_url} へ到達できませんでした。"
-            f"環境のアウトバウンド通信制限、またはリンク先サーバーのブロックの可能性があります。"
-            f"(詳細: {e})",
-            502,
-        )
+        return f"接続失敗: {video_url} へ到達できませんでした。(詳細: {e})", 502
     except httpx.HTTPStatusError as e:
         if r:
             await r.aclose()
@@ -364,6 +941,7 @@ async def download():
         response_headers["Content-Length"] = r.headers["Content-Length"]
 
     return Response(stream_download(), headers=response_headers)
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
