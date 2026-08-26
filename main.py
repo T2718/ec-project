@@ -299,50 +299,71 @@ async def download():
 
     filename = pathlib.Path(urlparse(video_url).path).name or "video.mp4"
 
-    # 動画配信サーバーのブロックを回避するための汎用ヘッダー
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": video_url
     }
 
-    # 接続・読み込みのタイムアウトを無制限に設定（読み込みが止まるのを防ぐ）
     timeout = httpx.Timeout(connect=15.0, read=None, write=None, pool=None)
 
+    # IPv6ルートが無い環境でのAll connection attempts failed対策として
+    # IPv4を明示的に優先させるtransportを使う
+    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+
+    client = None
+    r = None
     try:
-        # httpxのクライアントを生成してレスポンスヘッダーを取得
-        client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+        client = httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            transport=transport,
+        )
         req = client.build_request("GET", video_url, headers=headers)
         r = await client.send(req, stream=True)
         r.raise_for_status()
 
-        @stream_with_context
-        async def stream_download():
-            try:
-                # チャンクサイズを64KBに拡張（8KBだと小さすぎてオーバーヘッドが大きい）
-                async for chunk in r.aiter_bytes(chunk_size=65536):
-                    yield chunk
-            finally:
-                # 通信終了時に確実にクライアントとレスポンスを閉じる
-                await r.aclose()
-                await client.aclose()
-
-        # レスポンスヘッダーの構築
-        response_headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Type": r.headers.get("Content-Type", "video/mp4")
-        }
-
-        # 元サーバーから Content-Length が取得できればブラウザに渡す（進捗バーが正しく表示されます）
-        if "Content-Length" in r.headers:
-            response_headers["Content-Length"] = r.headers["Content-Length"]
-
-        return Response(
-            stream_download(),
-            headers=response_headers
+    except httpx.ConnectError as e:
+        # 接続自体が失敗した場合。原因切り分け用に詳細を出す
+        if r:
+            await r.aclose()
+        if client:
+            await client.aclose()
+        return (
+            f"接続失敗: {video_url} へ到達できませんでした。"
+            f"環境のアウトバウンド通信制限、またはリンク先サーバーのブロックの可能性があります。"
+            f"(詳細: {e})",
+            502,
         )
-
+    except httpx.HTTPStatusError as e:
+        if r:
+            await r.aclose()
+        if client:
+            await client.aclose()
+        return f"動画サーバーがエラーを返しました: {e.response.status_code}", 502
     except Exception as e:
+        if r:
+            await r.aclose()
+        if client:
+            await client.aclose()
         return f"ダウンロードエラー: {e}", 500
+
+    @stream_with_context
+    async def stream_download():
+        try:
+            async for chunk in r.aiter_bytes(chunk_size=65536):
+                yield chunk
+        finally:
+            await r.aclose()
+            await client.aclose()
+
+    response_headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Type": r.headers.get("Content-Type", "video/mp4")
+    }
+    if "Content-Length" in r.headers:
+        response_headers["Content-Length"] = r.headers["Content-Length"]
+
+    return Response(stream_download(), headers=response_headers)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
