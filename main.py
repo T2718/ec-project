@@ -5,9 +5,10 @@ import json
 import pathlib
 import itertools
 import asyncio
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from quart import Quart, request, render_template_string, Response, stream_with_context
 import httpx
+import aiofiles
 from bs4 import BeautifulSoup
 
 # Selenium関連
@@ -18,18 +19,23 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 app = Quart(__name__)
 
+# ダウンロード保存用ディレクトリ
+DOWNLOAD_DIR = pathlib.Path("./downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+
 siteList = {
     'zozovideo.com': {'name': 'zozo', 'code': 0},
     'jp.spankbang.com': {'name': 'spank', 'code': 1}
 }
 
-# 直接ダウンロードを許可する一般的な動画拡張子
 VIDEO_EXTENSIONS = ('.mp4', '.m4v', '.webm', '.ogv', '.mov', '.avi', '.m3u8')
 
 FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
+
+# --- Selenium関連ヘルパー ---
 
 def get_headless_driver():
     chrome_options = Options()
@@ -44,7 +50,6 @@ def get_headless_driver():
     return driver
 
 
-# 外部ブロックを防ぐため非同期でドライバーを実行
 async def getBySeleniumAsync(url, queue):
     await queue.put("⚙️ ヘッドレスChromeを起動中...")
     loop = asyncio.get_event_loop()
@@ -61,6 +66,8 @@ async def getBySeleniumAsync(url, queue):
         await loop.run_in_executor(None, driver.quit)
     return html
 
+
+# --- 各サイト専用スクレイピング ---
 
 def getZozo(soup):
     result = {'title': 'Unknown', 'status': [], 'information': {}}
@@ -111,7 +118,7 @@ def getSpank(soup):
     return result
 
 
-# --- 開発パネル用: HTML → 階層JSON変換 ---
+# --- HTML階層ツリー変換 ---
 
 def _attrs_to_dict(node):
     attrs = {}
@@ -123,7 +130,6 @@ def _attrs_to_dict(node):
 
 
 def parse_html_to_tree(html_text):
-    """HTMLをパースし、id付きの階層JSONツリーへ変換する"""
     soup = BeautifulSoup(html_text, 'html.parser')
     counter = itertools.count(0)
 
@@ -161,7 +167,6 @@ def parse_html_to_tree(html_text):
 
 
 def find_selector_ids(html_text, selector):
-    """同一のsoupインスタンス内でCSSセレクタ一致要素とツリーidの対応を取る"""
     soup = BeautifulSoup(html_text, 'html.parser')
     counter = itertools.count(0)
 
@@ -188,7 +193,7 @@ def find_selector_ids(html_text, selector):
     return matched_ids
 
 
-# --- WEB UI ---
+# --- WEB UI テンプレート ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ja">
@@ -199,7 +204,7 @@ HTML_TEMPLATE = """
     <style>
       body {
         font-family: Arial, sans-serif;
-        max-width: 600px;
+        max-width: 650px;
         margin: 40px auto;
         padding: 20px;
         background: #f9f9f9;
@@ -219,6 +224,10 @@ HTML_TEMPLATE = """
         border: 1px solid #ccc;
         border-radius: 4px;
       }
+      .btn-group {
+        display: flex;
+        gap: 10px;
+      }
       button {
         background: #007bff;
         color: white;
@@ -227,11 +236,11 @@ HTML_TEMPLATE = """
         border-radius: 4px;
         cursor: pointer;
         width: 100%;
-        font-size: 16px;
+        font-size: 15px;
       }
-      button:hover {
-        background: #0056b3;
-      }
+      button:hover { background: #0056b3; }
+      button.secondary { background: #6c757d; }
+      button.secondary:hover { background: #5a6268; }
       .download-btn {
         background: #28a745;
         margin-top: 15px;
@@ -245,9 +254,7 @@ HTML_TEMPLATE = """
         box-sizing: border-box;
         font-weight: bold;
       }
-      .download-btn:hover {
-        background: #218838;
-      }
+      .download-btn:hover { background: #218838; }
       #progress-box {
         display: none;
         background: #e9ecef;
@@ -257,10 +264,9 @@ HTML_TEMPLATE = """
         border-radius: 4px;
         font-size: 14px;
         color: #495057;
+        white-space: pre-wrap;
       }
-      #result-container {
-        margin-top: 20px;
-      }
+      #result-container { margin-top: 20px; }
       table {
         width: 100%;
         border-collapse: collapse;
@@ -271,9 +277,7 @@ HTML_TEMPLATE = """
         padding: 8px;
         text-align: left;
       }
-      th {
-        background: #f2f2f2;
-      }
+      th { background: #f2f2f2; }
 
       /* ===== 開発パネル ===== */
       #dev-btn {
@@ -287,16 +291,11 @@ HTML_TEMPLATE = """
         font-size: 14px;
         border-radius: 4px;
       }
-      #dev-btn:hover {
-        background: #23272b;
-      }
+      #dev-btn:hover { background: #23272b; }
       #dev-panel {
         display: none;
         position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
-        bottom: 0;
+        top: 0; left: 0; right: 0; bottom: 0;
         background: rgba(0, 0, 0, 0.5);
         z-index: 3000;
         align-items: center;
@@ -304,8 +303,7 @@ HTML_TEMPLATE = """
       }
       .dev-panel-inner {
         background: #fff;
-        width: 95%;
-        height: 90%;
+        width: 95%; height: 90%;
         max-width: 1100px;
         border-radius: 8px;
         display: flex;
@@ -319,27 +317,11 @@ HTML_TEMPLATE = """
         border-bottom: 1px solid #ddd;
         align-items: center;
       }
-      .dev-header input[type="text"] {
-        flex: 1;
-        margin: 0;
-      }
-      .dev-header button {
-        width: auto;
-        padding: 8px 14px;
-        white-space: nowrap;
-      }
-      .dev-close-btn {
-        background: #6c757d;
-      }
-      .dev-close-btn:hover {
-        background: #545b62;
-      }
-      .dev-status {
-        padding: 4px 12px;
-        font-size: 13px;
-        color: #555;
-        min-height: 20px;
-      }
+      .dev-header input[type="text"] { flex: 1; margin: 0; }
+      .dev-header button { width: auto; padding: 8px 14px; white-space: nowrap; }
+      .dev-close-btn { background: #6c757d; }
+      .dev-close-btn:hover { background: #545b62; }
+      .dev-status { padding: 4px 12px; font-size: 13px; color: #555; min-height: 20px; }
       .dev-search-bar {
         display: flex;
         gap: 8px;
@@ -348,28 +330,10 @@ HTML_TEMPLATE = """
         align-items: center;
         flex-wrap: wrap;
       }
-      .dev-search-bar select {
-        padding: 6px;
-        border-radius: 4px;
-        border: 1px solid #ccc;
-      }
-      .dev-search-bar input[type="text"] {
-        flex: 1;
-        min-width: 150px;
-        margin: 0;
-        padding: 6px;
-      }
-      .dev-search-bar button {
-        width: auto;
-        padding: 6px 12px;
-        font-size: 13px;
-      }
-      #search-counter {
-        font-size: 13px;
-        color: #333;
-        min-width: 60px;
-        text-align: center;
-      }
+      .dev-search-bar select { padding: 6px; border-radius: 4px; border: 1px solid #ccc; }
+      .dev-search-bar input[type="text"] { flex: 1; min-width: 150px; margin: 0; padding: 6px; }
+      .dev-search-bar button { width: auto; padding: 6px 12px; font-size: 13px; }
+      #search-counter { font-size: 13px; color: #333; min-width: 60px; text-align: center; }
       .tree-container {
         flex: 1;
         overflow: auto;
@@ -378,12 +342,8 @@ HTML_TEMPLATE = """
         font-size: 13px;
         background: #fafafa;
       }
-      .tree-node {
-        margin-left: 16px;
-      }
-      .tree-node:first-child {
-        margin-left: 0;
-      }
+      .tree-node { margin-left: 16px; }
+      .tree-node:first-child { margin-left: 0; }
       .node-line {
         cursor: pointer;
         padding: 1px 4px;
@@ -391,39 +351,15 @@ HTML_TEMPLATE = """
         white-space: pre-wrap;
         word-break: break-all;
       }
-      .node-line:hover {
-        background: #eef2f7;
-      }
-      .toggle {
-        display: inline-block;
-        width: 14px;
-        color: #888;
-      }
-      .tag-open {
-        color: #0b5394;
-      }
-      .attr-name {
-        color: #a52a2a;
-      }
-      .attr-value {
-        color: #1a7a1a;
-      }
-      .node-text {
-        color: #333;
-        margin-left: 6px;
-      }
-      .children {
-        margin-left: 4px;
-        border-left: 1px dashed #ccc;
-        padding-left: 6px;
-      }
-      .hl-line {
-        background: #fff3a0 !important;
-      }
-      .active-match {
-        outline: 2px solid #ff6600;
-        background: #ffd580 !important;
-      }
+      .node-line:hover { background: #eef2f7; }
+      .toggle { display: inline-block; width: 14px; color: #888; }
+      .tag-open { color: #0b5394; }
+      .attr-name { color: #a52a2a; }
+      .attr-value { color: #1a7a1a; }
+      .node-text { color: #333; margin-left: 6px; }
+      .children { margin-left: 4px; border-left: 1px dashed #ccc; padding-left: 6px; }
+      .hl-line { background: #fff3a0 !important; }
+      .active-match { outline: 2px solid #ff6600; background: #ffd580 !important; }
     </style>
   </head>
   <body>
@@ -444,7 +380,7 @@ HTML_TEMPLATE = """
             <option value="text">文字列</option>
             <option value="selector">CSSクエリ</option>
           </select>
-          <input type="text" id="search-input" placeholder="検索キーワード / セレクタ (例: div.title, #video)" onkeydown="if(event.key==='Enter'){ runSearch(); }">
+          <input type="text" id="search-input" placeholder="検索キーワード / セレクタ" onkeydown="if(event.key==='Enter'){ runSearch(); }">
           <button type="button" onclick="runSearch()">検索</button>
           <button type="button" onclick="gotoMatch(matchIndex - 1)">◀ 前へ</button>
           <span id="search-counter">0 / 0</span>
@@ -455,18 +391,24 @@ HTML_TEMPLATE = """
       </div>
     </div>
 
-    <h2>🎬 EC動画解析 & ダウンロード (非同期)</h2>
+    <h2>🎬 EC動画解析 & ダウンロード</h2>
     <div>
-      <input type="text" id="url-input" placeholder="動画のURLを入力（zozo / spankbang / 直接動画URL）" required>
-      <button type="button" id="start-btn">解析スタート</button>
+      <input type="text" id="url-input" placeholder="動画URLを入力 (zozo / spankbang / YouTube / 各種Web動画)" required>
+      <div class="btn-group">
+        <button type="button" id="start-btn">通常解析 (Selenium)</button>
+        <button type="button" id="ytdlp-btn" class="secondary">汎用解析 (yt-dlp)</button>
+      </div>
     </div>
 
     <div id="progress-box">⏳ 進捗ステータス待ち...</div>
     <div id="result-container"></div>
 
     <script>
-      // ===================== メイン解析機能 =====================
-      document.getElementById('start-btn').addEventListener('click', function () {
+      // ===================== イベントハンドラ =====================
+      document.getElementById('start-btn').addEventListener('click', () => executeAnalyze('/analyze?url='));
+      document.getElementById('ytdlp-btn').addEventListener('click', () => executeAnalyze('/yt-dlp?action=info&url='));
+
+      function executeAnalyze(endpointPrefix) {
         const url = document.getElementById('url-input').value.trim();
         if (!url) return alert('URLを入力してください');
 
@@ -477,7 +419,7 @@ HTML_TEMPLATE = """
         progressBox.innerText = '🚀 サーバーへ解析要求を送信中...';
         resultContainer.innerHTML = '';
 
-        const eventSource = new EventSource('/analyze?url=' + encodeURIComponent(url));
+        const eventSource = new EventSource(endpointPrefix + encodeURIComponent(url));
 
         eventSource.onmessage = function (event) {
           const data = JSON.parse(event.data);
@@ -496,10 +438,40 @@ HTML_TEMPLATE = """
         };
 
         eventSource.onerror = function () {
-          progressBox.innerText = '⚠️ 通信中にエラーが発生しました。';
+          progressBox.innerText = '⚠️ 通信エラーが発生しました。';
           eventSource.close();
         };
-      });
+      }
+
+      function downloadWithYtdlp(targetUrl) {
+        const progressBox = document.getElementById('progress-box');
+        progressBox.style.display = 'block';
+        progressBox.innerText = '🚀 yt-dlpのダウンロード処理を開始します...';
+
+        const eventSource = new EventSource('/yt-dlp?action=download&url=' + encodeURIComponent(targetUrl));
+
+        eventSource.onmessage = function (event) {
+          const data = JSON.parse(event.data);
+
+          if (data.type === 'progress') {
+            progressBox.innerText = data.message;
+          } else if (data.type === 'success') {
+            progressBox.innerText = '✅ サーバーでのダウンロードと結合が完了しました！';
+            if (data.data.file_url) {
+              window.location.href = data.data.file_url;
+            }
+            eventSource.close();
+          } else if (data.type === 'error') {
+            alert('ダウンロード失敗: ' + data.message);
+            eventSource.close();
+          }
+        };
+
+        eventSource.onerror = function () {
+          progressBox.innerText = '⚠️ 通信エラーが発生しました。';
+          eventSource.close();
+        };
+      }
 
       function renderResult(data, originalUrl) {
         let infoRows = '';
@@ -512,18 +484,21 @@ HTML_TEMPLATE = """
         let html = `
           <div class="card">
             <h3>🎵 ${data.title || 'タイトル不明'}</h3>
+            ${data.thumbnail ? `<img src="${data.thumbnail}" style="max-width:100%; border-radius:4px; margin-bottom:10px;">` : ''}
             ${infoRows ? `<h4>📋 作品情報</h4><table>${infoRows}</table>` : ''}
-            <h4>🔗 リンク</h4>
+            <h4>🔗 リンク & ダウンロード</h4>
             <p>・元ページ: <a href="${originalUrl}" target="_blank">${originalUrl}</a></p>
         `;
 
         if (data.video_url) {
           html += `
             <p>・直接動画: <a href="${data.video_url}" target="_blank">ブラウザで動画を開く</a></p>
-            <a class="download-btn" href="/download?video_url=${encodeURIComponent(data.video_url)}">📥 この動画をダウンロード (MP4保存)</a>
+            <a class="download-btn" href="/download?video_url=${encodeURIComponent(data.video_url)}">📥 直接ストリーム保存 (MP4)</a>
           `;
         } else {
-          html += `<p style="color: orange;">⚠️ 動画URLの解析に失敗したか、ページ内に見つかりませんでした。</p>`;
+          html += `
+            <button class="download-btn" onclick="downloadWithYtdlp('${originalUrl}')">📥 yt-dlp でサーバー経由取得・保存</button>
+          `;
         }
 
         html += `</div>`;
@@ -538,20 +513,11 @@ HTML_TEMPLATE = """
       let matches = [];
       let matchIndex = -1;
 
-      function openDevPanel() {
-        document.getElementById('dev-panel').style.display = 'flex';
-      }
-
-      function closeDevPanel() {
-        document.getElementById('dev-panel').style.display = 'none';
-      }
+      function openDevPanel() { document.getElementById('dev-panel').style.display = 'flex'; }
+      function closeDevPanel() { document.getElementById('dev-panel').style.display = 'none'; }
 
       function escapeHtml(str) {
-        return String(str)
-          .replaceAll('&', '&amp;')
-          .replaceAll('<', '&lt;')
-          .replaceAll('>', '&gt;')
-          .replaceAll('"', '&quot;');
+        return String(str).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
       }
 
       function renderAttrs(attrs) {
@@ -562,7 +528,7 @@ HTML_TEMPLATE = """
 
       function renderNode(node) {
         const hasChildren = node.children.length > 0;
-        const toggleChar = hasChildren ? '▶' : '　';
+        const toggleChar = hasChildren ? '▶' : ' ';
         const attrsHtml = renderAttrs(node.attrs);
         const textHtml = node.text ? `<span class="node-text">${escapeHtml(node.text)}</span>` : '';
         const childrenHtml = node.children.map(renderNode).join('');
@@ -573,9 +539,7 @@ HTML_TEMPLATE = """
               <span class="tag-open">&lt;${escapeHtml(node.tag)}${attrsHtml}&gt;</span>
               ${textHtml}
             </div>
-            <div class="children" style="display:none;">
-              ${childrenHtml}
-            </div>
+            <div class="children" style="display:none;">${childrenHtml}</div>
           </div>`;
       }
 
@@ -588,9 +552,7 @@ HTML_TEMPLATE = """
         if (!childrenBox || childrenBox.children.length === 0) return;
         const isOpen = childrenBox.style.display !== 'none';
         childrenBox.style.display = isOpen ? 'none' : 'block';
-        if (toggle.textContent.trim()) {
-          toggle.textContent = isOpen ? '▶' : '▼';
-        }
+        if (toggle.textContent.trim()) { toggle.textContent = isOpen ? '▶' : '▼'; }
       }
 
       function buildMaps(node, parentId) {
@@ -607,10 +569,8 @@ HTML_TEMPLATE = """
 
         statusEl.textContent = '⏳ 取得中...';
         treeContainer.innerHTML = '';
-        matches = [];
-        matchIndex = -1;
-        idParentMap = {};
-        idNodeMap = {};
+        matches = []; matchIndex = -1;
+        idParentMap = {}; idNodeMap = {};
         updateCounter();
 
         try {
@@ -630,17 +590,13 @@ HTML_TEMPLATE = """
         }
       }
 
-      function nodeMatchesTag(node, q) {
-        return node.tag.toLowerCase() === q.toLowerCase();
-      }
-
+      function nodeMatchesTag(node, q) { return node.tag.toLowerCase() === q.toLowerCase(); }
       function nodeMatchesText(node, q) {
         const ql = q.toLowerCase();
         if (node.tag.toLowerCase().includes(ql)) return true;
         if (node.text && node.text.toLowerCase().includes(ql)) return true;
         for (const k in node.attrs) {
-          if (k.toLowerCase().includes(ql)) return true;
-          if (String(node.attrs[k]).toLowerCase().includes(ql)) return true;
+          if (k.toLowerCase().includes(ql) || String(node.attrs[k]).toLowerCase().includes(ql)) return true;
         }
         return false;
       }
@@ -658,10 +614,7 @@ HTML_TEMPLATE = """
             body: JSON.stringify({ html: currentHtml, selector: selector })
           });
           const data = await res.json();
-          if (!data.ok) {
-            alert(data.message || 'クエリエラー');
-            return [];
-          }
+          if (!data.ok) { alert(data.message || 'クエリエラー'); return []; }
           return data.matched_ids;
         } catch (e) {
           alert('クエリ通信エラー: ' + e);
@@ -676,11 +629,7 @@ HTML_TEMPLATE = """
 
       function updateCounter() {
         const el = document.getElementById('search-counter');
-        if (matches.length === 0) {
-          el.textContent = '0 / 0';
-          return;
-        }
-        el.textContent = (matchIndex + 1) + ' / ' + matches.length;
+        el.textContent = matches.length === 0 ? '0 / 0' : (matchIndex + 1) + ' / ' + matches.length;
       }
 
       async function runSearch() {
@@ -689,22 +638,13 @@ HTML_TEMPLATE = """
         const q = document.getElementById('search-input').value.trim();
 
         clearHighlights();
-        matches = [];
-        matchIndex = -1;
-
-        if (!q) {
-          updateCounter();
-          return;
-        }
+        matches = []; matchIndex = -1;
+        if (!q) { updateCounter(); return; }
 
         let ids = [];
-        if (mode === 'tag') {
-          collectMatches(currentTree, n => nodeMatchesTag(n, q), ids);
-        } else if (mode === 'text') {
-          collectMatches(currentTree, n => nodeMatchesText(n, q), ids);
-        } else if (mode === 'selector') {
-          ids = await queryBySelector(q);
-        }
+        if (mode === 'tag') collectMatches(currentTree, n => nodeMatchesTag(n, q), ids);
+        else if (mode === 'text') collectMatches(currentTree, n => nodeMatchesText(n, q), ids);
+        else if (mode === 'selector') ids = await queryBySelector(q);
 
         matches = ids;
         matches.forEach(id => {
@@ -718,14 +658,12 @@ HTML_TEMPLATE = """
 
       function gotoMatch(i) {
         if (matches.length === 0) return;
-
         const prevActive = document.querySelector('.active-match');
         if (prevActive) prevActive.classList.remove('active-match');
 
         matchIndex = ((i % matches.length) + matches.length) % matches.length;
         const id = matches[matchIndex];
 
-        // 祖先を展開して表示状態にする
         let pid = idParentMap[id];
         while (pid !== undefined && pid !== -1) {
           const parentEl = document.getElementById('node-' + pid);
@@ -751,32 +689,27 @@ HTML_TEMPLATE = """
 """
 
 
+# --- ルーティング定義 ---
+
 @app.route('/')
 async def index():
     return await render_template_string(HTML_TEMPLATE)
 
 
-# --- 開発パネル用エンドポイント ---
+# --- 開発パネルAPI ---
 
 @app.route('/inspect/fetch')
 async def inspect_fetch():
     url = request.args.get('url', '').strip()
-    if not url:
-        return {'ok': False, 'message': 'URLが空です'}, 400
-    if not re.match(r'^https?://', url):
-        return {'ok': False, 'message': '不正なURLです（http/httpsのみ対応）'}, 400
+    if not url or not re.match(r'^https?://', url):
+        return {'ok': False, 'message': '有効なURLを指定してください'}, 400
 
     timeout = httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=15.0)
-
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.get(url, headers=FETCH_HEADERS)
             r.raise_for_status()
             html_text = r.text
-    except httpx.ConnectError as e:
-        return {'ok': False, 'message': f'接続失敗: {e}'}, 502
-    except httpx.HTTPStatusError as e:
-        return {'ok': False, 'message': f'サーバーがエラーを返しました: {e.response.status_code}'}, 502
     except Exception as e:
         return {'ok': False, 'message': f'取得エラー: {e}'}, 500
 
@@ -791,17 +724,17 @@ async def inspect_query():
     selector = (data.get('selector') or '').strip()
 
     if not html_text or not selector:
-        return {'ok': False, 'message': 'htmlまたはselectorが空です'}, 400
+        return {'ok': False, 'message': '入力値が不正です'}, 400
 
     try:
         matched_ids = find_selector_ids(html_text, selector)
     except Exception as e:
-        return {'ok': False, 'message': f'セレクタが不正です: {e}'}, 400
+        return {'ok': False, 'message': f'セレクタの実行失敗: {e}'}, 400
 
     return {'ok': True, 'matched_ids': matched_ids}
 
 
-# --- 動画解析 ---
+# --- Selenium等による標準動画解析 ---
 
 @app.route('/analyze')
 async def analyze():
@@ -813,12 +746,8 @@ async def analyze():
 
     async def generate_progress():
         try:
-            if not url:
-                yield sse("error", message="URLが空です")
-                return
-
-            if not re.match(r'^https?://([^/]+)', url):
-                yield sse("error", message="不正なURL構造です")
+            if not url or not re.match(r'^https?://([^/]+)', url):
+                yield sse("error", message="URL形式が正しくありません")
                 return
 
             parsed_url = urlparse(url)
@@ -841,7 +770,7 @@ async def analyze():
             async def run_scraper():
                 try:
                     html_text = await getBySeleniumAsync(url, queue)
-                    await queue.put("🔍 解析用スープを作成中 (BeautifulSoup)...")
+                    await queue.put("🔍 BeautifulSoupで要素解析を開始...")
                     soup = BeautifulSoup(html_text, 'html.parser')
 
                     await queue.put("⚡ ターゲットデータを抽出中...")
@@ -882,18 +811,126 @@ async def analyze():
     return Response(generate_progress(), headers=headers)
 
 
+# --- yt-dlp による汎用動画取得ルート ---
+
+@app.route('/yt-dlp')
+async def yt_dlp_route():
+    url = request.args.get('url', '').strip()
+    action = request.args.get('action', 'info').strip()
+
+    def sse(event_type, **kwargs):
+        payload = {"type": event_type, **kwargs}
+        return f'data: {json.dumps(payload, ensure_ascii=False)}\n\n'
+
+    async def generate_stream():
+        if not url or not re.match(r'^https?://', url):
+            yield sse("error", message="不正なURLです")
+            return
+
+        # 1. 情報解析モード
+        if action == 'info':
+            yield sse("progress", message="🔍 yt-dlpでメタデータを抽出中...")
+            cmd = ["yt-dlp", "-j", "--no-warnings", url]
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                err_msg = stderr.decode('utf-8', errors='ignore')
+                yield sse("error", message=f"yt-dlp解析エラー: {err_msg[:200]}")
+                return
+
+            try:
+                info = json.loads(stdout.decode('utf-8'))
+                result_data = {
+                    'title': info.get('title', 'Unknown Title'),
+                    'thumbnail': info.get('thumbnail', ''),
+                    'webpage_url': info.get('webpage_url', url),
+                    'information': {
+                        'タイトル': info.get('title', 'Unknown'),
+                        '投稿者': info.get('uploader', '不明'),
+                        '再生時間': info.get('duration_string', '不明'),
+                        'フォーマット': info.get('ext', 'mp4')
+                    }
+                }
+                yield sse("success", data=result_data)
+            except Exception as e:
+                yield sse("error", message=f"JSON解析エラー: {e}")
+            return
+
+        # 2. ダウンロード処理モード
+        elif action == 'download':
+            yield sse("progress", message="🚀 yt-dlpのダウンロードを開始します...")
+            output_template = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
+
+            cmd = [
+                "yt-dlp",
+                "-f", "b[ext=mp4]/b",
+                "-o", output_template,
+                "--newline",
+                "--no-warnings",
+                url
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            filename = None
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                line_str = line.decode('utf-8', errors='ignore').strip()
+
+                if line_str.startswith("[download]"):
+                    yield sse("progress", message=f"📥 {line_str}")
+                    if "Destination:" in line_str:
+                        filename = line_str.split("Destination:", 1)[1].strip()
+                    elif "has already been downloaded" in line_str:
+                        filename = line_str.split("[download]", 1)[1].replace("has already been downloaded", "").strip()
+
+                elif line_str.startswith("[Merger]") or line_str.startswith("[ExtractAudio]"):
+                    yield sse("progress", message="⚙️ 映像と音声を結合中...")
+
+            await process.wait()
+
+            if process.returncode == 0:
+                fn_param = pathlib.Path(filename).name if filename else ""
+                yield sse("success", data={
+                    "message": "完了しました！",
+                    "file_url": f"/yt-dlp/file?path={quote(fn_param)}"
+                })
+            else:
+                stderr_data = await process.stderr.read()
+                err_msg = stderr_data.decode('utf-8', errors='ignore')
+                yield sse("error", message=f"ダウンロード失敗: {err_msg[:200]}")
+
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return Response(generate_stream(), headers=headers)
+
+
+# --- ファイル配信プロキシ ---
+
 @app.route('/download')
 async def download():
     video_url = request.args.get('video_url')
     if not video_url:
-        return "URLが指定されていません", 400
+        return "URLが未指定です", 400
 
     filename = pathlib.Path(urlparse(video_url).path).name or "video.mp4"
-
-    headers = {
-        **FETCH_HEADERS,
-        "Referer": video_url,
-    }
+    headers = {**FETCH_HEADERS, "Referer": video_url}
 
     timeout = httpx.Timeout(connect=15.0, read=None, write=None, pool=None)
     transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
@@ -905,24 +942,10 @@ async def download():
         req = client.build_request("GET", video_url, headers=headers)
         r = await client.send(req, stream=True)
         r.raise_for_status()
-    except httpx.ConnectError as e:
-        if r:
-            await r.aclose()
-        if client:
-            await client.aclose()
-        return f"接続失敗: {video_url} へ到達できませんでした。(詳細: {e})", 502
-    except httpx.HTTPStatusError as e:
-        if r:
-            await r.aclose()
-        if client:
-            await client.aclose()
-        return f"動画サーバーがエラーを返しました: {e.response.status_code}", 502
     except Exception as e:
-        if r:
-            await r.aclose()
-        if client:
-            await client.aclose()
-        return f"ダウンロードエラー: {e}", 500
+        if r: await r.aclose()
+        if client: await client.aclose()
+        return f"通信エラー: {e}", 502
 
     @stream_with_context
     async def stream_download():
@@ -941,6 +964,28 @@ async def download():
         response_headers["Content-Length"] = r.headers["Content-Length"]
 
     return Response(stream_download(), headers=response_headers)
+
+
+@app.route('/yt-dlp/file')
+async def yt_dlp_file_route():
+    filename = request.args.get('path', '').strip()
+    file_path = DOWNLOAD_DIR / filename
+
+    if not filename or not file_path.exists() or not file_path.is_file():
+        return "ファイルが見つかりません", 404
+
+    @stream_with_context
+    async def stream_file():
+        async with aiofiles.open(file_path, mode='rb') as f:
+            while chunk := await f.read(65536):
+                yield chunk
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Type": "video/mp4",
+        "Content-Length": str(file_path.stat().st_size)
+    }
+    return Response(stream_file(), headers=headers)
 
 
 if __name__ == '__main__':
