@@ -19,7 +19,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 app = Quart(__name__)
 
-# ダウンロード保存用ディレクトリ
+# ダウンロード保存用ディレクトリ (yt-dlp用)
 DOWNLOAD_DIR = pathlib.Path("./downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
@@ -28,6 +28,7 @@ siteList = {
     'jp.spankbang.com': {'name': 'spank', 'code': 1}
 }
 
+# 直接ダウンロードを許可する一般的な動画拡張子
 VIDEO_EXTENSIONS = ('.mp4', '.m4v', '.webm', '.ogv', '.mov', '.avi', '.m3u8')
 
 FETCH_HEADERS = {
@@ -35,7 +36,7 @@ FETCH_HEADERS = {
 }
 
 
-# --- Selenium関連ヘルパー ---
+# --- Selenium・手動解析関連 (main 3 ベース) ---
 
 def get_headless_driver():
     chrome_options = Options()
@@ -66,8 +67,6 @@ async def getBySeleniumAsync(url, queue):
         await loop.run_in_executor(None, driver.quit)
     return html
 
-
-# --- 各サイト専用スクレイピング ---
 
 def getZozo(soup):
     result = {'title': 'Unknown', 'status': [], 'information': {}}
@@ -118,7 +117,7 @@ def getSpank(soup):
     return result
 
 
-# --- HTML階層ツリー変換 ---
+# --- HTML階層ツリー変換 (main 3 開発パネル用) ---
 
 def _attrs_to_dict(node):
     attrs = {}
@@ -193,14 +192,14 @@ def find_selector_ids(html_text, selector):
     return matched_ids
 
 
-# --- WEB UI テンプレート ---
+# --- 統合 WEB UI テンプレート ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ja">
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EC Video Helper</title>
+    <title>EC Video Helper (統合版)</title>
     <style>
       body {
         font-family: Arial, sans-serif;
@@ -386,7 +385,7 @@ HTML_TEMPLATE = """
             <option value="text">文字列</option>
             <option value="selector">CSSクエリ</option>
           </select>
-          <input type="text" id="search-input" placeholder="検索キーワード / セレクタ" onkeydown="if(event.key==='Enter'){ runSearch(); }">
+          <input type="text" id="search-input" placeholder="検索キーワード / セレクタ (例: div.title, #video)" onkeydown="if(event.key==='Enter'){ runSearch(); }">
           <button type="button" onclick="runSearch()">検索</button>
           <button type="button" onclick="gotoMatch(matchIndex - 1)">◀ 前へ</button>
           <span id="search-counter">0 / 0</span>
@@ -397,12 +396,12 @@ HTML_TEMPLATE = """
       </div>
     </div>
 
-    <h2>🎬 EC動画解析 & 自動事前ダウンロード</h2>
+    <h2>🎬 EC動画解析 & ダウンロード</h2>
     <div>
-      <input type="text" id="url-input" placeholder="動画URLを入力すると自動で取得開始します" required>
+      <input type="text" id="url-input" placeholder="動画のURLを入力（zozo / spankbang / 直接動画URL）" required>
       <div class="btn-group">
-        <button type="button" id="start-btn">手動解析 (Selenium)</button>
-        <button type="button" id="ytdlp-btn" class="secondary">手動取得 (yt-dlp)</button>
+        <button type="button" id="start-btn">🔍 手動解析 (main 3)</button>
+        <button type="button" id="ytdlp-btn" class="secondary">⚡ yt-dlp 取得 (main 4)</button>
       </div>
     </div>
 
@@ -411,26 +410,10 @@ HTML_TEMPLATE = """
 
     <script>
       let currentEventSource = null;
-      let lastProcessedUrl = '';
 
-      // URL入力と同時に自動バックグラウンドダウンロードを実行
-      const urlInput = document.getElementById('url-input');
-      urlInput.addEventListener('input', () => {
-        const url = urlInput.value.trim();
-        if (url && url.startsWith('http') && url !== lastProcessedUrl) {
-          lastProcessedUrl = url;
-          downloadWithYtdlp(url);
-        }
-      });
-
-      document.getElementById('start-btn').addEventListener('click', () => executeAnalyze('/analyze?url='));
-      document.getElementById('ytdlp-btn').addEventListener('click', () => {
-        const url = urlInput.value.trim();
-        if (url) downloadWithYtdlp(url);
-      });
-
-      function executeAnalyze(endpointPrefix) {
-        const url = urlInput.value.trim();
+      // ===================== 手動解析 (main 3) =====================
+      document.getElementById('start-btn').addEventListener('click', function () {
+        const url = document.getElementById('url-input').value.trim();
         if (!url) return alert('URLを入力してください');
 
         if (currentEventSource) currentEventSource.close();
@@ -442,7 +425,7 @@ HTML_TEMPLATE = """
         progressBox.innerText = '🚀 サーバーへ解析要求を送信中...';
         resultContainer.innerHTML = '';
 
-        currentEventSource = new EventSource(endpointPrefix + encodeURIComponent(url));
+        currentEventSource = new EventSource('/analyze?url=' + encodeURIComponent(url));
 
         currentEventSource.onmessage = function (event) {
           const data = JSON.parse(event.data);
@@ -451,7 +434,7 @@ HTML_TEMPLATE = """
             progressBox.innerText = data.message;
           } else if (data.type === 'success') {
             progressBox.innerText = '✅ 解析が完了しました！';
-            renderResult(data.data, url);
+            renderManualResult(data.data, url);
             currentEventSource.close();
           } else if (data.type === 'error') {
             progressBox.style.display = 'none';
@@ -461,10 +444,46 @@ HTML_TEMPLATE = """
         };
 
         currentEventSource.onerror = function () {
-          progressBox.innerText = '⚠️ 通信エラーが発生しました。';
+          progressBox.innerText = '⚠️ 通信中にエラーが発生しました。';
           currentEventSource.close();
         };
+      });
+
+      function renderManualResult(data, originalUrl) {
+        let infoRows = '';
+        if (data.information) {
+          for (const [k, v] of Object.entries(data.information)) {
+            infoRows += `<tr><th>${k}</th><td>${v}</td></tr>`;
+          }
+        }
+
+        let html = `
+          <div class="card">
+            <h3>🎵 ${data.title || 'タイトル不明'}</h3>
+            ${infoRows ? `<h4>📋 作品情報</h4><table>${infoRows}</table>` : ''}
+            <h4>🔗 リンク</h4>
+            <p>・元ページ: <a href="${originalUrl}" target="_blank">${originalUrl}</a></p>
+        `;
+
+        if (data.video_url) {
+          html += `
+            <p>・直接動画: <a href="${data.video_url}" target="_blank">ブラウザで動画を開く</a></p>
+            <a class="download-btn" href="/download?video_url=${encodeURIComponent(data.video_url)}">📥 この動画をダウンロード (MP4保存)</a>
+          `;
+        } else {
+          html += `<p style="color: orange;">⚠️ 動画URLの解析に失敗したか、ページ内に見つかりませんでした。</p>`;
+        }
+
+        html += `</div>`;
+        document.getElementById('result-container').innerHTML = html;
       }
+
+      // ===================== yt-dlp 取得 (main 4) =====================
+      document.getElementById('ytdlp-btn').addEventListener('click', function () {
+        const url = document.getElementById('url-input').value.trim();
+        if (!url) return alert('URLを入力してください');
+        downloadWithYtdlp(url);
+      });
 
       function downloadWithYtdlp(targetUrl) {
         if (currentEventSource) currentEventSource.close();
@@ -472,7 +491,7 @@ HTML_TEMPLATE = """
         const progressBox = document.getElementById('progress-box');
         const resultContainer = document.getElementById('result-container');
         progressBox.style.display = 'block';
-        progressBox.innerText = '🚀 バックグラウンドでyt-dlpによる事前ダウンロードを開始しました...';
+        progressBox.innerText = '🚀 バックグラウンドでyt-dlpによるダウンロードを開始しました...';
         resultContainer.innerHTML = '';
 
         currentEventSource = new EventSource('/yt-dlp?action=download&url=' + encodeURIComponent(targetUrl));
@@ -483,7 +502,7 @@ HTML_TEMPLATE = """
           if (data.type === 'progress') {
             progressBox.innerText = data.message;
           } else if (data.type === 'success') {
-            progressBox.innerText = '✅ サーバー上の事前読み込み・結合が完了しました！即時ダウンロードできます。';
+            progressBox.innerText = '✅ サーバー上の処理が完了しました！即時ダウンロードできます。';
             renderCompletedVideo(data.data.file_url, data.data.stream_url, targetUrl);
             currentEventSource.close();
           } else if (data.type === 'error') {
@@ -502,7 +521,7 @@ HTML_TEMPLATE = """
       function renderCompletedVideo(fileUrl, streamUrl, originalUrl) {
         let html = `
           <div class="card">
-            <h3>🎬 取得完了した動画</h3>
+            <h3>🎬 yt-dlp 取得完了動画</h3>
             <video controls autoplay src="${streamUrl}"></video>
             <p style="margin-top:10px;">・元ページ: <a href="${originalUrl}" target="_blank">${originalUrl}</a></p>
             <a class="download-btn" href="${fileUrl}">📥 すぐに保存（ワンクリックダウンロード）</a>
@@ -511,39 +530,7 @@ HTML_TEMPLATE = """
         document.getElementById('result-container').innerHTML = html;
       }
 
-      function renderResult(data, originalUrl) {
-        let infoRows = '';
-        if (data.information) {
-          for (const [k, v] of Object.entries(data.information)) {
-            infoRows += `<tr><th>${k}</th><td>${v}</td></tr>`;
-          }
-        }
-
-        let html = `
-          <div class="card">
-            <h3>🎵 ${data.title || 'タイトル不明'}</h3>
-            ${data.thumbnail ? `<img src="${data.thumbnail}" style="max-width:100%; border-radius:4px; margin-bottom:10px;">` : ''}
-            ${infoRows ? `<h4>📋 作品情報</h4><table>${infoRows}</table>` : ''}
-            <h4>🔗 リンク & ダウンロード</h4>
-            <p>・元ページ: <a href="${originalUrl}" target="_blank">${originalUrl}</a></p>
-        `;
-
-        if (data.video_url) {
-          html += `
-            <video controls src="${data.video_url}"></video>
-            <a class="download-btn" href="/download?video_url=${encodeURIComponent(data.video_url)}">📥 直接ストリーム保存 (MP4)</a>
-          `;
-        } else {
-          html += `
-            <button class="download-btn" onclick="downloadWithYtdlp('${originalUrl}')">📥 yt-dlp でサーバー経由取得・保存</button>
-          `;
-        }
-
-        html += `</div>`;
-        document.getElementById('result-container').innerHTML = html;
-      }
-
-      // ===================== 開発パネル機能 =====================
+      // ===================== 開発パネル機能 (main 3) =====================
       let currentTree = null;
       let currentHtml = '';
       let idParentMap = {};
@@ -727,27 +714,32 @@ HTML_TEMPLATE = """
 """
 
 
-# --- ルーティング定義 ---
-
 @app.route('/')
 async def index():
     return await render_template_string(HTML_TEMPLATE)
 
 
-# --- 開発パネルAPI ---
+# --- 開発パネル用エンドポイント (main 3) ---
 
 @app.route('/inspect/fetch')
 async def inspect_fetch():
     url = request.args.get('url', '').strip()
-    if not url or not re.match(r'^https?://', url):
-        return {'ok': False, 'message': '有効なURLを指定してください'}, 400
+    if not url:
+        return {'ok': False, 'message': 'URLが空です'}, 400
+    if not re.match(r'^https?://', url):
+        return {'ok': False, 'message': '不正なURLです（http/httpsのみ対応）'}, 400
 
     timeout = httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=15.0)
+
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.get(url, headers=FETCH_HEADERS)
             r.raise_for_status()
             html_text = r.text
+    except httpx.ConnectError as e:
+        return {'ok': False, 'message': f'接続失敗: {e}'}, 502
+    except httpx.HTTPStatusError as e:
+        return {'ok': False, 'message': f'サーバーがエラーを返しました: {e.response.status_code}'}, 502
     except Exception as e:
         return {'ok': False, 'message': f'取得エラー: {e}'}, 500
 
@@ -762,17 +754,17 @@ async def inspect_query():
     selector = (data.get('selector') or '').strip()
 
     if not html_text or not selector:
-        return {'ok': False, 'message': '入力値が不正です'}, 400
+        return {'ok': False, 'message': 'htmlまたはselectorが空です'}, 400
 
     try:
         matched_ids = find_selector_ids(html_text, selector)
     except Exception as e:
-        return {'ok': False, 'message': f'セレクタの実行失敗: {e}'}, 400
+        return {'ok': False, 'message': f'セレクタが不正です: {e}'}, 400
 
     return {'ok': True, 'matched_ids': matched_ids}
 
 
-# --- Selenium等による標準動画解析 ---
+# --- 動画手動解析 (main 3) ---
 
 @app.route('/analyze')
 async def analyze():
@@ -784,8 +776,12 @@ async def analyze():
 
     async def generate_progress():
         try:
-            if not url or not re.match(r'^https?://([^/]+)', url):
-                yield sse("error", message="URL形式が正しくありません")
+            if not url:
+                yield sse("error", message="URLが空です")
+                return
+
+            if not re.match(r'^https?://([^/]+)', url):
+                yield sse("error", message="不正なURL構造です")
                 return
 
             parsed_url = urlparse(url)
@@ -808,7 +804,7 @@ async def analyze():
             async def run_scraper():
                 try:
                     html_text = await getBySeleniumAsync(url, queue)
-                    await queue.put("🔍 BeautifulSoupで要素解析を開始...")
+                    await queue.put("🔍 解析用スープを作成中 (BeautifulSoup)...")
                     soup = BeautifulSoup(html_text, 'html.parser')
 
                     await queue.put("⚡ ターゲットデータを抽出中...")
@@ -849,7 +845,7 @@ async def analyze():
     return Response(generate_progress(), headers=headers)
 
 
-# --- yt-dlp による汎用動画取得ルート ---
+# --- yt-dlp による取得ルート (main 4) ---
 
 @app.route('/yt-dlp')
 async def yt_dlp_route():
@@ -865,7 +861,6 @@ async def yt_dlp_route():
             yield sse("error", message="不正なURLです")
             return
 
-        # 1. 情報解析モード
         if action == 'info':
             yield sse("progress", message="🔍 yt-dlpでメタデータを抽出中...")
             cmd = ["yt-dlp", "-j", "--no-warnings", url]
@@ -900,7 +895,6 @@ async def yt_dlp_route():
                 yield sse("error", message=f"JSON解析エラー: {e}")
             return
 
-        # 2. ダウンロード処理モード
         elif action == 'download':
             yield sse("progress", message="🚀 yt-dlpのダウンロードを開始します...")
             output_template = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
@@ -960,7 +954,7 @@ async def yt_dlp_route():
     return Response(generate_stream(), headers=headers)
 
 
-# --- ファイル配信 & ストリーミング プロキシ ---
+# --- ファイルストリーミング・プロキシ & ダウンロード ---
 
 @app.route('/stream/file')
 async def stream_file_route():
@@ -983,49 +977,6 @@ async def stream_file_route():
     return Response(stream_file(), headers=headers)
 
 
-@app.route('/download')
-async def download():
-    video_url = request.args.get('video_url')
-    if not video_url:
-        return "URLが未指定です", 400
-
-    filename = pathlib.Path(urlparse(video_url).path).name or "video.mp4"
-    headers = {**FETCH_HEADERS, "Referer": video_url}
-
-    timeout = httpx.Timeout(connect=15.0, read=None, write=None, pool=None)
-    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
-
-    client = None
-    r = None
-    try:
-        client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, transport=transport)
-        req = client.build_request("GET", video_url, headers=headers)
-        r = await client.send(req, stream=True)
-        r.raise_for_status()
-    except Exception as e:
-        if r: await r.aclose()
-        if client: await client.aclose()
-        return f"通信エラー: {e}", 502
-
-    @stream_with_context
-    async def stream_download():
-        try:
-            async for chunk in r.aiter_bytes(chunk_size=65536):
-                yield chunk
-        finally:
-            await r.aclose()
-            await client.aclose()
-
-    response_headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "Content-Type": r.headers.get("Content-Type", "video/mp4")
-    }
-    if "Content-Length" in r.headers:
-        response_headers["Content-Length"] = r.headers["Content-Length"]
-
-    return Response(stream_download(), headers=response_headers)
-
-
 @app.route('/yt-dlp/file')
 async def yt_dlp_file_route():
     filename = request.args.get('path', '').strip()
@@ -1046,6 +997,61 @@ async def yt_dlp_file_route():
         "Content-Length": str(file_path.stat().st_size)
     }
     return Response(stream_file(), headers=headers)
+
+
+@app.route('/download')
+async def download():
+    video_url = request.args.get('video_url')
+    if not video_url:
+        return "URLが指定されていません", 400
+
+    filename = pathlib.Path(urlparse(video_url).path).name or "video.mp4"
+
+    headers = {
+        **FETCH_HEADERS,
+        "Referer": video_url,
+    }
+
+    timeout = httpx.Timeout(connect=15.0, read=None, write=None, pool=None)
+    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
+
+    client = None
+    r = None
+    try:
+        client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, transport=transport)
+        req = client.build_request("GET", video_url, headers=headers)
+        r = await client.send(req, stream=True)
+        r.raise_for_status()
+    except httpx.ConnectError as e:
+        if r: await r.aclose()
+        if client: await client.aclose()
+        return f"接続失敗: {video_url} へ到達できませんでした。(詳細: {e})", 502
+    except httpx.HTTPStatusError as e:
+        if r: await r.aclose()
+        if client: await client.aclose()
+        return f"動画サーバーがエラーを返しました: {e.response.status_code}", 502
+    except Exception as e:
+        if r: await r.aclose()
+        if client: await client.aclose()
+        return f"ダウンロードエラー: {e}", 500
+
+    @stream_with_context
+    async def stream_download():
+        try:
+            async for chunk in r.aiter_bytes(chunk_size=65536):
+                yield chunk
+        finally:
+            await r.aclose()
+            await client.aclose()
+
+    response_headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Type": r.headers.get("Content-Type", "video/mp4")
+    }
+    if "Content-Length" in r.headers:
+        response_headers["Content-Length"] = r.headers["Content-Length"]
+
+    return Response(stream_download(), headers=response_headers)
 
 
 if __name__ == '__main__':
