@@ -22,4 +22,4 @@ COPY . .
 RUN pip install --no-cache-dir -r requirements.txt uvicorn gunicorn
 
 # Renderから割り当てられる PORT 環境変数（無ければ5000）で起動
-CMD exec gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-5000} --timeout 300 app:app
+CMD exec gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-5000} --timeout 300 main:app
