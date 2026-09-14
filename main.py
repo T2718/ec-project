@@ -267,6 +267,12 @@ HTML_TEMPLATE = """
         white-space: pre-wrap;
       }
       #result-container { margin-top: 20px; }
+      video {
+        width: 100%;
+        border-radius: 8px;
+        margin-top: 10px;
+        background: #000;
+      }
       table {
         width: 100%;
         border-collapse: collapse;
@@ -391,12 +397,12 @@ HTML_TEMPLATE = """
       </div>
     </div>
 
-    <h2>🎬 EC動画解析 & ダウンロード</h2>
+    <h2>🎬 EC動画解析 & 自動事前ダウンロード</h2>
     <div>
-      <input type="text" id="url-input" placeholder="動画URLを入力 (zozo / spankbang / YouTube / 各種Web動画)" required>
+      <input type="text" id="url-input" placeholder="動画URLを入力すると自動で取得開始します" required>
       <div class="btn-group">
-        <button type="button" id="start-btn">通常解析 (Selenium)</button>
-        <button type="button" id="ytdlp-btn" class="secondary">汎用解析 (yt-dlp)</button>
+        <button type="button" id="start-btn">手動解析 (Selenium)</button>
+        <button type="button" id="ytdlp-btn" class="secondary">手動取得 (yt-dlp)</button>
       </div>
     </div>
 
@@ -404,13 +410,30 @@ HTML_TEMPLATE = """
     <div id="result-container"></div>
 
     <script>
-      // ===================== イベントハンドラ =====================
+      let currentEventSource = null;
+      let lastProcessedUrl = '';
+
+      // URL入力と同時に自動バックグラウンドダウンロードを実行
+      const urlInput = document.getElementById('url-input');
+      urlInput.addEventListener('input', () => {
+        const url = urlInput.value.trim();
+        if (url && url.startsWith('http') && url !== lastProcessedUrl) {
+          lastProcessedUrl = url;
+          downloadWithYtdlp(url);
+        }
+      });
+
       document.getElementById('start-btn').addEventListener('click', () => executeAnalyze('/analyze?url='));
-      document.getElementById('ytdlp-btn').addEventListener('click', () => executeAnalyze('/yt-dlp?action=info&url='));
+      document.getElementById('ytdlp-btn').addEventListener('click', () => {
+        const url = urlInput.value.trim();
+        if (url) downloadWithYtdlp(url);
+      });
 
       function executeAnalyze(endpointPrefix) {
-        const url = document.getElementById('url-input').value.trim();
+        const url = urlInput.value.trim();
         if (!url) return alert('URLを入力してください');
+
+        if (currentEventSource) currentEventSource.close();
 
         const progressBox = document.getElementById('progress-box');
         const resultContainer = document.getElementById('result-container');
@@ -419,9 +442,9 @@ HTML_TEMPLATE = """
         progressBox.innerText = '🚀 サーバーへ解析要求を送信中...';
         resultContainer.innerHTML = '';
 
-        const eventSource = new EventSource(endpointPrefix + encodeURIComponent(url));
+        currentEventSource = new EventSource(endpointPrefix + encodeURIComponent(url));
 
-        eventSource.onmessage = function (event) {
+        currentEventSource.onmessage = function (event) {
           const data = JSON.parse(event.data);
 
           if (data.type === 'progress') {
@@ -429,48 +452,63 @@ HTML_TEMPLATE = """
           } else if (data.type === 'success') {
             progressBox.innerText = '✅ 解析が完了しました！';
             renderResult(data.data, url);
-            eventSource.close();
+            currentEventSource.close();
           } else if (data.type === 'error') {
             progressBox.style.display = 'none';
             resultContainer.innerHTML = `<div class="card" style="color: red;">❌ エラー: ${data.message}</div>`;
-            eventSource.close();
+            currentEventSource.close();
           }
         };
 
-        eventSource.onerror = function () {
+        currentEventSource.onerror = function () {
           progressBox.innerText = '⚠️ 通信エラーが発生しました。';
-          eventSource.close();
+          currentEventSource.close();
         };
       }
 
       function downloadWithYtdlp(targetUrl) {
+        if (currentEventSource) currentEventSource.close();
+
         const progressBox = document.getElementById('progress-box');
+        const resultContainer = document.getElementById('result-container');
         progressBox.style.display = 'block';
-        progressBox.innerText = '🚀 yt-dlpのダウンロード処理を開始します...';
+        progressBox.innerText = '🚀 バックグラウンドでyt-dlpによる事前ダウンロードを開始しました...';
+        resultContainer.innerHTML = '';
 
-        const eventSource = new EventSource('/yt-dlp?action=download&url=' + encodeURIComponent(targetUrl));
+        currentEventSource = new EventSource('/yt-dlp?action=download&url=' + encodeURIComponent(targetUrl));
 
-        eventSource.onmessage = function (event) {
+        currentEventSource.onmessage = function (event) {
           const data = JSON.parse(event.data);
 
           if (data.type === 'progress') {
             progressBox.innerText = data.message;
           } else if (data.type === 'success') {
-            progressBox.innerText = '✅ サーバーでのダウンロードと結合が完了しました！';
-            if (data.data.file_url) {
-              window.location.href = data.data.file_url;
-            }
-            eventSource.close();
+            progressBox.innerText = '✅ サーバー上の事前読み込み・結合が完了しました！即時ダウンロードできます。';
+            renderCompletedVideo(data.data.file_url, data.data.stream_url, targetUrl);
+            currentEventSource.close();
           } else if (data.type === 'error') {
-            alert('ダウンロード失敗: ' + data.message);
-            eventSource.close();
+            progressBox.style.display = 'none';
+            resultContainer.innerHTML = `<div class="card" style="color: red;">❌ エラー: ${data.message}</div>`;
+            currentEventSource.close();
           }
         };
 
-        eventSource.onerror = function () {
+        currentEventSource.onerror = function () {
           progressBox.innerText = '⚠️ 通信エラーが発生しました。';
-          eventSource.close();
+          currentEventSource.close();
         };
+      }
+
+      function renderCompletedVideo(fileUrl, streamUrl, originalUrl) {
+        let html = `
+          <div class="card">
+            <h3>🎬 取得完了した動画</h3>
+            <video controls autoplay src="${streamUrl}"></video>
+            <p style="margin-top:10px;">・元ページ: <a href="${originalUrl}" target="_blank">${originalUrl}</a></p>
+            <a class="download-btn" href="${fileUrl}">📥 すぐに保存（ワンクリックダウンロード）</a>
+          </div>
+        `;
+        document.getElementById('result-container').innerHTML = html;
       }
 
       function renderResult(data, originalUrl) {
@@ -492,7 +530,7 @@ HTML_TEMPLATE = """
 
         if (data.video_url) {
           html += `
-            <p>・直接動画: <a href="${data.video_url}" target="_blank">ブラウザで動画を開く</a></p>
+            <video controls src="${data.video_url}"></video>
             <a class="download-btn" href="/download?video_url=${encodeURIComponent(data.video_url)}">📥 直接ストリーム保存 (MP4)</a>
           `;
         } else {
@@ -905,7 +943,8 @@ async def yt_dlp_route():
                 fn_param = pathlib.Path(filename).name if filename else ""
                 yield sse("success", data={
                     "message": "完了しました！",
-                    "file_url": f"/yt-dlp/file?path={quote(fn_param)}"
+                    "file_url": f"/yt-dlp/file?path={quote(fn_param)}",
+                    "stream_url": f"/stream/file?path={quote(fn_param)}"
                 })
             else:
                 stderr_data = await process.stderr.read()
@@ -921,7 +960,28 @@ async def yt_dlp_route():
     return Response(generate_stream(), headers=headers)
 
 
-# --- ファイル配信プロキシ ---
+# --- ファイル配信 & ストリーミング プロキシ ---
+
+@app.route('/stream/file')
+async def stream_file_route():
+    filename = request.args.get('path', '').strip()
+    file_path = DOWNLOAD_DIR / filename
+
+    if not filename or not file_path.exists() or not file_path.is_file():
+        return "ファイルが見つかりません", 404
+
+    @stream_with_context
+    async def stream_file():
+        async with aiofiles.open(file_path, mode='rb') as f:
+            while chunk := await f.read(65536):
+                yield chunk
+
+    headers = {
+        "Content-Type": "video/mp4",
+        "Content-Length": str(file_path.stat().st_size)
+    }
+    return Response(stream_file(), headers=headers)
+
 
 @app.route('/download')
 async def download():
