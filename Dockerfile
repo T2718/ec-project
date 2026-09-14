@@ -1,11 +1,12 @@
 FROM python:3.10-slim
 
-# 各種依存パッケージとGoogle Chromeのインストール
+# 各種依存パッケージ、ffmpeg、Google Chromeのインストール
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
     curl \
     unzip \
+    ffmpeg \
     && mkdir -p /etc/apt/keyrings \
     && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg \
     && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
@@ -17,10 +18,8 @@ WORKDIR /app
 
 COPY . .
 
-# quartの非同期処理を本番運用するために uvicorn もあわせてインストール
-RUN pip install --no-cache-dir -r requirements.txt uvicorn
+# 依存ライブラリのインストール
+RUN pip install --no-cache-dir -r requirements.txt uvicorn gunicorn
 
-EXPOSE 5000
-
-# GunicornにUvicornWorkerクラスを噛ませて非同期実行します
-CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:5000", "--timeout", "120", "main:app"]
+# Renderから割り当てられる PORT 環境変数（無ければ5000）で起動
+CMD exec gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-5000} --timeout 300 app:app
