@@ -18,9 +18,9 @@ WORKDIR /app
 
 COPY . .
 
-# 依存ライブラリのインストール
-RUN pip install --no-cache-dir -r requirements_v1.txt uvicorn gunicorn
+# 依存ライブラリのインストール（元のrequirements.txtと内容は同一）
+RUN pip install --no-cache-dir -r requirements.txt uvicorn gunicorn
 
 # ワーカーは1つ固定（library.jsonのメモリキャッシュ整合性のため）
 # Renderから割り当てられる PORT 環境変数（無ければ5000）で起動
-CMD exec gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-5000} --timeout 600 main_v1:app
+CMD exec gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-5000} --timeout 600 main:app
