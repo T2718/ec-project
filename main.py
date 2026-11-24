@@ -25,7 +25,6 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
-
 app = Quart(__name__)
 
 BASE_DIR = pathlib.Path(__file__).parent
